@@ -30,16 +30,16 @@ from textual.widgets.option_list import Option
 RESULT_LIMIT = 200
 DEBOUNCE_SECONDS = 0.25
 PROGRESS_INTERVAL_SECONDS = 0.2
-# 以深藍灰底與柔和霧藍標示焦點，保持終端長時間閱讀的清楚對比。
+# 以深黑背景搭配柔和霧藍焦點，保持終端長時間閱讀的清楚對比。
 BLUE_THEME = Theme(
     name="file-finder-blue",
     primary="#7896b9",
     secondary="#92a4ba",
     accent="#7896b9",
     foreground="#d8e2ee",
-    background="#101722",
-    surface="#172130",
-    panel="#1d2b3d",
+    background="#080808",
+    surface="#101010",
+    panel="#181818",
     warning="#c5b48e",
     error="#d49a9a",
     success="#91b4a3",
@@ -56,7 +56,7 @@ BLUE_THEME = Theme(
         "block-cursor-blurred-text-style": "none",
         "block-hover-background": "#223246",
         "input-cursor-background": "#7896b9",
-        "input-cursor-foreground": "#101722",
+        "input-cursor-foreground": "#080808",
         "input-selection-background": "#2a405a",
         "input-selection-foreground": "#d8e2ee",
         "scrollbar": "#2a405a",
