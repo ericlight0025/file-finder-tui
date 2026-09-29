@@ -22,6 +22,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -29,6 +30,40 @@ from textual.widgets.option_list import Option
 RESULT_LIMIT = 200
 DEBOUNCE_SECONDS = 0.25
 PROGRESS_INTERVAL_SECONDS = 0.2
+# 以深藍灰底與柔和霧藍標示焦點，保持終端長時間閱讀的清楚對比。
+BLUE_THEME = Theme(
+    name="file-finder-blue",
+    primary="#7896b9",
+    secondary="#92a4ba",
+    accent="#7896b9",
+    foreground="#d8e2ee",
+    background="#101722",
+    surface="#172130",
+    panel="#1d2b3d",
+    warning="#c5b48e",
+    error="#d49a9a",
+    success="#91b4a3",
+    dark=True,
+    variables={
+        "text-muted": "#92a4ba",
+        "border-blurred": "#1d2b3d",
+        "border": "#7896b9",
+        "block-cursor-background": "#2a405a",
+        "block-cursor-foreground": "#d8e2ee",
+        "block-cursor-text-style": "bold",
+        "block-cursor-blurred-background": "#1d2b3d",
+        "block-cursor-blurred-foreground": "#92a4ba",
+        "block-cursor-blurred-text-style": "none",
+        "block-hover-background": "#223246",
+        "input-cursor-background": "#7896b9",
+        "input-cursor-foreground": "#101722",
+        "input-selection-background": "#2a405a",
+        "input-selection-foreground": "#d8e2ee",
+        "scrollbar": "#2a405a",
+        "scrollbar-hover": "#7896b9",
+        "scrollbar-active": "#7896b9",
+    },
+)
 REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 EXECUTABLE_SUFFIXES = {
     ".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".psd1", ".vbs",
@@ -475,13 +510,19 @@ class ErrorDetails(ModalScreen[None]):
 class FileFinderApp(App):
     TITLE = "File Finder"
     CSS = """
-    Screen { layout: vertical; }
-    #title { height: 1; margin: 1 2 0 2; text-style: bold; }
-    #search { margin: 1 2; }
+    Screen { layout: vertical; background: $background; color: $foreground; }
+    #title { height: 1; margin: 1 2 0 2; color: $primary; text-style: bold; }
+    #search { margin: 1 2; border: round $border-blurred; background: $surface; }
+    #search:focus { border: round $primary; background-tint: transparent; }
+    #search > .input--placeholder { color: $text-muted; }
     #location { height: auto; max-height: 3; margin: 0 2; color: $text-muted; }
-    #results { height: 1fr; margin: 0 2; border: round $primary; }
-    #status { height: auto; max-height: 5; margin: 0 2; }
-    #keys { height: auto; margin: 0 2 1 2; color: $text-muted; }
+    #results { height: 1fr; margin: 0 2; border: round $border-blurred; background: $surface; scrollbar-size-vertical: 1; }
+    #results:focus { border: round $primary; background-tint: transparent; }
+    #results > .option-list--option-disabled { color: $primary; text-style: bold; }
+    #status { height: auto; max-height: 5; margin: 0 2; padding: 0 1; background: $panel; color: $foreground; }
+    #keys { height: auto; margin: 0 2 1 2; padding: 0 1; color: $text-muted; }
+    #error-list { border: round $border-blurred; background: $background; scrollbar-size-vertical: 1; }
+    #error-list:focus { border: round $primary; background-tint: transparent; }
     """
     BINDINGS = [
         Binding("ctrl+l", "focus_search", "搜尋", priority=True),
@@ -496,6 +537,8 @@ class FileFinderApp(App):
 
     def __init__(self, config_path: Path, favorites_path: Path | None = None, opener: Callable[[str], None] | None = None):
         super().__init__()
+        self.register_theme(BLUE_THEME)
+        self.theme = BLUE_THEME.name
         self.config_path = config_path.absolute()
         self.favorites_path = favorites_path.absolute() if favorites_path else self.config_path.with_name("favorites.json")
         self.configuration_error = ""
