@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .favorites-*.tmp
+
+# 個人搜尋路徑與收藏只保存在本機。
+/config.json
+/favorites.json

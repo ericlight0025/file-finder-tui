@@ -11,7 +11,7 @@
 - 比對名稱時使用 `casefold()`，先連續子字串，再依序字元。例如 `rpt` 可命中 `report.xlsx`；不讀取其內容。
 - 排序依序為連續子字串、資料夾、名稱長度、名稱。相同名稱以完整路徑穩定排序。
 - 最多保留排序最佳的 200 筆搜尋結果，但在掃描完成後顯示實際命中總數，並非找到 200 筆就停止。
-- 達上限、取消或出現讀取錯誤時，標示「結果不完整」與「已找到至少 N 筆」。所有錯誤保留在本次記憶體報告中，底部顯示錯誤數量與第一項資訊。
+- 達上限、取消或出現讀取錯誤時，標示「結果不完整」與「已找到至少 N 筆」。所有錯誤保留在本次記憶體報告中，底部顯示錯誤數量與第一項資訊；按 `Ctrl+E` 可捲動查看目前畫面的全部讀取錯誤。
 - 資料夾即時讀取直接子項目，不遞迴展開；瀏覽清單不套用 200 筆搜尋結果上限。
 - 最愛以同目錄暫存檔、`flush`、`fsync`、`os.replace` 原子保存；寫入失敗時保留原 JSON 與記憶體收藏。
 
@@ -37,11 +37,17 @@
 Set-Location 'C:\path\to\file-finder-tui'
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+if (-not (Test-Path .\config.json)) {
+    Copy-Item .\config.example.json .\config.json
+}
+notepad .\config.json
 ```
 
 如果 `py -3.11` 無法執行，請將 `py -3.11` 換成已安裝的 Python 3.11+ 執行檔完整路徑。直接呼叫虛擬環境中的 Python 即可，無需啟用 `Activate.ps1`。
 
-輸入設定為程式旁的 `config.json`，`roots` 必須剛好三筆，且 `path` 必須為絕對路徑。JSON 中反斜線需寫成 `\\`：
+Git 僅追蹤設定範本 `config.example.json`。實際使用的 `config.json` 與個人收藏 `favorites.json` 已加入 `.gitignore`，本次遷移保留本機原有內容並取消 Git 追蹤。首次執行請以上述指令建立設定；缺少設定時程式會顯示建立提示。首次收藏時會建立 `favorites.json`。
+
+輸入設定預設為程式旁的 `config.json`，首頁會顯示實際讀取的設定檔完整路徑。`roots` 必須剛好三筆，且 `path` 必須為絕對路徑。JSON 中反斜線需寫成 `\\`：
 
 ```json
 {
@@ -83,9 +89,10 @@ Set-Location 'C:\path\to\file-finder-tui'
 | `Enter` | 清單中開啟檔案或進入資料夾 |
 | `F` | 清單取得焦點時加入／取消資料夾最愛；輸入欄位內仍是正常文字 |
 | `Ctrl+L` | 聚焦搜尋欄位 |
-| `Backspace`／`Alt+←` | 清單中返回前一個瀏覽畫面；輸入欄位中 Backspace 正常刪字 |
-| `Alt+→` | 清單中前往剛才返回的畫面 |
-| `Esc` | 清除搜尋並返回首頁；確認對話框中取消開啟 |
+| `Backspace` | 清單中返回前一個瀏覽畫面；輸入欄位中正常刪字 |
+| `Alt+←`／`Alt+→` | 搜尋欄位或清單取得焦點時返回／前進；對話框內不切換瀏覽歷史 |
+| `Ctrl+E` | 查看目前畫面的全部讀取錯誤；清單可用方向鍵或 PageUp／PageDown 捲動 |
+| `Esc` | 清除搜尋並返回首頁；確認對話框中取消開啟，錯誤詳情中關閉對話框 |
 | `Ctrl+Q` | 結束程式 |
 | 滑鼠單擊 | 選取並開啟項目；執行檔仍需確認 |
 
@@ -113,22 +120,23 @@ pytest 僅供測試，不是程式執行依賴：
 
 ```powershell
 Set-Location 'C:\path\to\file-finder-tui'
-py -3.11 -m pip install pytest
-py -3.11 -m pytest -q
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m compileall -q main.py tests
 ```
 
 測試以 pytest 的 `tmp_path`／`tempfile` 建立三個根目錄與多層假資料，測試名稱搜尋、同名路徑、排序與 200 筆限制、掃描上限、取消與過期結果、歷史、即時子項目、收藏重載／原子寫入失敗、無效設定、權限與網路例外，以及 Textual 鍵盤／滑鼠操作和執行確認。Windows junction 測試只在暫存資料夾建立迴圈，不需符號連結管理員權限。
 
-最近一次驗證使用 Python 3.11 執行 pytest，結果為 `62 passed`；`compileall` 也成功。測試只建立暫存假資料。
+最近一次驗證在原始碼的 Python 3.11 與安裝資料夾的 Python 3.12 環境分別執行 pytest，兩者皆為 `67 passed`；Python 3.11 的 `compileall` 也成功。新增驗證涵蓋設定檔絕對路徑、輸入欄位中的前後導航、全部錯誤顯示及對話框不影響主畫面操作。測試只建立暫存假資料。
 
 ## 檔案與後續使用
 
 ```text
 file-finder-tui/
 ├── main.py
-├── config.json
-├── favorites.json
+├── config.example.json
+├── config.json         # 本機設定，Git 忽略
+├── favorites.json      # 本機收藏，Git 忽略
 ├── requirements.txt
 ├── README.md
 ├── .gitignore

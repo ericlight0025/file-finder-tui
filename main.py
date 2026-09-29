@@ -67,6 +67,8 @@ class Config:
 def load_config(path: Path) -> Config:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError as error:
+        raise ValueError(f"無法讀取 config.json，設定檔尚未建立：{path}\n請參考 config.example.json 建立設定檔，填入三個搜尋資料夾後重啟。") from error
     except (OSError, ValueError) as error:
         raise ValueError(f"無法讀取 config.json，請檢查檔案與 JSON 格式：{path}") from error
     roots = data.get("roots") if isinstance(data, dict) else None
@@ -131,7 +133,7 @@ class ScanReport:
         if self.skipped_links:
             result += f"；已排除 {self.skipped_links} 個連結／reparse point"
         if self.errors:
-            result += f"\n{self.errors[0]}"
+            result += f"；Ctrl+E 查看全部錯誤\n{self.errors[0]}"
         return result
 
 
@@ -412,6 +414,36 @@ class ConfirmOpen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ErrorDetails(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "返回")]
+    DEFAULT_CSS = """
+    ErrorDetails { align: center middle; background: $background 70%; }
+    ErrorDetails > Vertical { width: 90%; height: 85%; padding: 1 2; border: round $warning; background: $surface; }
+    ErrorDetails Static { height: auto; }
+    #error-list { height: 1fr; margin: 1 0; }
+    """
+
+    def __init__(self, errors: tuple[str, ...]):
+        super().__init__()
+        self.errors = errors
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(f"讀取錯誤（共 {len(self.errors)} 項）", markup=False)
+            yield OptionList(*(Option(f"{index}. {error}") for index, error in enumerate(self.errors, 1)), id="error-list", markup=False)
+            yield Static("↑↓／PageUp／PageDown 捲動 | Esc 返回", markup=False)
+            yield Button("返回", id="error-close")
+
+    def on_mount(self) -> None:
+        self.query_one("#error-list", OptionList).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
 class FileFinderApp(App):
     TITLE = "File Finder"
     CSS = """
@@ -427,16 +459,18 @@ class FileFinderApp(App):
         Binding("ctrl+l", "focus_search", "搜尋", priority=True),
         Binding("escape", "home", "首頁"),
         Binding("ctrl+q", "quit", "結束", priority=True),
-        Binding("alt+left", "back", "上一頁", priority=True),
+        Binding("alt+left", "history_back", "上一頁", priority=True),
         Binding("alt+right", "forward", "下一頁", priority=True),
+        Binding("ctrl+e", "errors", "錯誤詳情", priority=True),
         Binding("f,F", "favorite", "最愛", show=False),
         Binding("backspace", "back", "返回", show=False),
     ]
 
     def __init__(self, config_path: Path, favorites_path: Path | None = None, opener: Callable[[str], None] | None = None):
         super().__init__()
-        self.config_path = config_path
-        self.favorites_path = favorites_path or config_path.with_name("favorites.json")
+        self.config_path = config_path.absolute()
+        self.favorites_path = favorites_path.absolute() if favorites_path else self.config_path.with_name("favorites.json")
+        self.configuration_error = ""
         self.config: Config | None = None
         self.favorites: Favorites | None = None
         self.navigation = Navigation()
@@ -448,10 +482,10 @@ class FileFinderApp(App):
     def compose(self) -> ComposeResult:
         yield Static("File Finder", id="title")
         yield Input(placeholder="搜尋檔案或資料夾…", id="search", select_on_focus=False)
-        yield Static("", id="location", markup=False)
+        yield Static(f"首頁\n設定檔：{self.config_path}", id="location", markup=False)
         yield OptionList(id="results", markup=False)
         yield Static("正在驗證設定與根目錄…", id="status", markup=False)
-        yield Static("↑↓ 選取 | Enter 開啟 | F 最愛 | Backspace／Alt+← 返回 | Alt+→ 前進 | Esc 首頁\nCtrl+L 搜尋 | Ctrl+Q 結束 | 滑鼠單擊選取並開啟", id="keys", markup=False)
+        yield Static("↑↓ 選取 | Enter 開啟 | F 最愛 | Backspace／Alt+← 返回 | Alt+→ 前進 | Esc 首頁\nCtrl+L 搜尋 | Ctrl+E 錯誤詳情 | Ctrl+Q 結束 | 滑鼠單擊選取並開啟", id="keys", markup=False)
 
     def on_mount(self) -> None:
         generation, cancel = self.gate.invalidate()
@@ -538,6 +572,7 @@ class FileFinderApp(App):
         view = self.navigation.view
         if message.kind == "initialize":
             self.config, self.favorites, items, error = message.payload
+            self.configuration_error = error
             view.items = items
             view.status = error or self.home_status(items)
             self.query_one(Input).disabled = self.config is None
@@ -560,6 +595,8 @@ class FileFinderApp(App):
         warnings = [self.favorites.error] if self.favorites and self.favorites.error else []
         if invalid:
             warnings.append(f"{len(invalid)} 個根目錄／最愛無法讀取；{invalid[0]}")
+        if warnings:
+            warnings.append("Ctrl+E 查看全部錯誤")
         return "準備搜尋" + ("\n" + "\n".join(warnings) if warnings else "")
 
     @staticmethod
@@ -568,7 +605,7 @@ class FileFinderApp(App):
         if report.errors or report.cancelled:
             text = f"資料夾讀取不完整，已讀取 {report.total} 筆"
         if report.errors:
-            text += f"；{len(report.errors)} 項錯誤\n{report.errors[0]}"
+            text += f"；{len(report.errors)} 項錯誤；Ctrl+E 查看全部錯誤\n{report.errors[0]}"
         if report.skipped_links:
             text += f"；已排除 {report.skipped_links} 個連結／reparse point"
         return text
@@ -603,10 +640,11 @@ class FileFinderApp(App):
         elif options:
             results.action_first()
         view.selected = results.highlighted
-        location = str(view.directory) if view.kind == "browse" else (f"搜尋：{view.query}（固定三個根目錄）" if view.kind == "search" else "首頁")
+        location = str(view.directory) if view.kind == "browse" else (f"搜尋：{view.query}（固定三個根目錄）" if view.kind == "search" else f"首頁\n設定檔：{self.config_path}")
         self.query_one("#location", Static).update(location)
         self.set_status(view.status)
 
+    @on(OptionList.OptionHighlighted, "#results")
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         self.navigation.view.selected = event.option_index
 
@@ -621,6 +659,7 @@ class FileFinderApp(App):
             event.stop()
             event.prevent_default()
 
+    @on(OptionList.OptionSelected, "#results")
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         view = self.navigation.view
         if event.option_index >= len(view.items):
@@ -663,6 +702,8 @@ class FileFinderApp(App):
             self.query_one(Input).focus()
 
     def action_home(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.config is None:
             # 初始化尚未完成或設定無效時，保留目前提示與初始化工作。
             self.set_input("")
@@ -676,7 +717,12 @@ class FileFinderApp(App):
         self.query_one(Input).focus()
 
     def action_back(self) -> None:
-        if not isinstance(self.focused, OptionList):
+        if isinstance(self.screen, ModalScreen) or not isinstance(self.focused, OptionList):
+            return
+        self.action_history_back()
+
+    def action_history_back(self) -> None:
+        if isinstance(self.screen, ModalScreen) or self.config is None:
             return
         if not self.navigation.history:
             self.set_status("沒有可返回的瀏覽畫面；Esc 可返回首頁")
@@ -686,7 +732,7 @@ class FileFinderApp(App):
         self.restore_navigation_view(generation, cancel)
 
     def action_forward(self) -> None:
-        if not isinstance(self.focused, OptionList):
+        if isinstance(self.screen, ModalScreen) or self.config is None:
             return
         if not self.navigation.forward_history:
             self.set_status("沒有可前進的瀏覽畫面。")
@@ -707,8 +753,30 @@ class FileFinderApp(App):
         elif view.report is None:
             self.start_search(generation, view.query, cancel)
 
+    def current_errors(self) -> tuple[str, ...]:
+        view = self.navigation.view
+        if view.report is not None:
+            return view.report.errors
+        if view.kind == "home":
+            errors = [item.error for item in view.items if item is not None and item.error]
+            if self.favorites and self.favorites.error:
+                errors.append(self.favorites.error)
+            if self.configuration_error:
+                errors.append(self.configuration_error)
+            return tuple(errors)
+        return ()
+
+    def action_errors(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        errors = self.current_errors()
+        if errors:
+            self.push_screen(ErrorDetails(errors))
+        else:
+            self.set_status("目前畫面沒有讀取錯誤。")
+
     def action_favorite(self) -> None:
-        if not isinstance(self.focused, OptionList) or self.favorites is None:
+        if isinstance(self.screen, ModalScreen) or not isinstance(self.focused, OptionList) or self.favorites is None:
             return
         index = self.query_one(OptionList).highlighted
         if index is None or index >= len(self.navigation.view.items):

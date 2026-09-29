@@ -5,10 +5,10 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from textual.widgets import Input, OptionList
+from textual.widgets import Input, OptionList, Static
 
 import main
-from main import Config, ConfirmOpen, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, View, browse_folder
+from main import Config, ConfirmOpen, ErrorDetails, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, View, browse_folder
 
 
 async def wait_until(predicate, timeout=5):
@@ -126,6 +126,8 @@ def test_tui_search_enter_back_escape_and_input_backspace(project):
             assert app.navigation.view.kind == "search"
             assert app.query_one(Input).value == "rpt"
             assert app.navigation.view.items[0].path == deep
+            await pilot.press("ctrl+l")
+            assert isinstance(app.focused, Input)
             await pilot.press("alt+right")
             await wait_until(lambda: app.navigation.view.kind == "browse" and app.navigation.view.directory == deep)
             assert app.query_one(Input).value == ""
@@ -250,6 +252,11 @@ def test_tui_executable_confirmation_and_normal_open(project):
             await pilot.press("enter")
             assert isinstance(app.screen, ConfirmOpen)
             assert opened == []
+            await pilot.press("alt+left", "alt+right", "ctrl+e", "f")
+            assert isinstance(app.screen, ConfirmOpen)
+            assert app.navigation.view.directory == root
+            assert len(app.navigation.history) == 1
+            assert app.favorites.paths == []
             await pilot.press("escape")
             assert opened == []
             await pilot.press("enter")
@@ -260,6 +267,72 @@ def test_tui_executable_confirmation_and_normal_open(project):
             await pilot.press("enter")
             await wait_until(lambda: len(opened) == 2)
             assert opened[1] == str(ordinary)
+
+    asyncio.run(scenario())
+
+
+def test_home_shows_active_config_path(project, monkeypatch):
+    _, file = project
+    monkeypatch.chdir(file.parent)
+
+    async def scenario():
+        app = FileFinderApp(Path("config.json"))
+        async with app.run_test(size=(110, 40)):
+            await wait_until(lambda: app.config is not None)
+            assert app.config_path == file
+            assert str(file) in str(app.query_one("#location", Static).render())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["home", "search", "browse"])
+def test_all_errors_modal_preserves_navigation_and_favorites(project, kind):
+    config, file = project
+    missing = config.roots[0].path / "missing"
+    errors = tuple(f"{missing / str(index)}：沒有讀取權限" for index in range(30))
+    opened = []
+
+    async def scenario():
+        app = FileFinderApp(file, opener=opened.append)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            app.navigation.enter(config.roots[0].path)
+            view = app.navigation.view
+            view.kind = kind
+            view.items = tuple(Item(missing / str(index), True, error=error) for index, error in enumerate(errors))
+            view.report = None if kind == "home" else ScanReport(errors=errors)
+            app.render_view()
+            app.query_one("#results", OptionList).focus()
+            selected = app.navigation.view.selected
+            await pilot.press("ctrl+e")
+            assert isinstance(app.screen, ErrorDetails)
+            error_list = app.screen.query_one("#error-list", OptionList)
+            assert error_list.option_count == len(errors)
+            assert errors[-1] in str(error_list.get_option_at_index(29).prompt)
+            await pilot.press("end", "enter", "f", "backspace", "alt+left", "alt+right", "ctrl+l")
+            assert isinstance(app.screen, ErrorDetails)
+            assert app.navigation.view is view
+            assert app.navigation.view.selected == selected
+            assert app.favorites.paths == []
+            assert not opened
+            await pilot.press("escape")
+            assert not isinstance(app.screen, ErrorDetails)
+            assert app.navigation.view is view
+
+    asyncio.run(scenario())
+
+
+def test_missing_config_error_details_and_guidance(tmp_path):
+    async def scenario():
+        app = FileFinderApp(tmp_path / "config.json")
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.query_one(Input).disabled)
+            assert "config.example.json" in app.navigation.view.status
+            await pilot.press("ctrl+e")
+            assert isinstance(app.screen, ErrorDetails)
+            assert str(tmp_path / "config.json") in app.screen.errors[0]
+            await pilot.click("#error-close")
+            assert not isinstance(app.screen, ErrorDetails)
 
     asyncio.run(scenario())
 
