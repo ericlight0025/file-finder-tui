@@ -8,7 +8,7 @@ import pytest
 from textual.widgets import Input, OptionList, Static
 
 import main
-from main import Config, ConfirmOpen, ErrorDetails, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, View, browse_folder
+from main import Config, ConfirmOpen, ErrorDetails, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, SearchProgress, View, browse_folder
 
 
 async def wait_until(predicate, timeout=5):
@@ -149,7 +149,7 @@ def test_tui_debounce_responsiveness_and_stale_result_guard(project, monkeypatch
     started, release, old_cancelled = Event(), Event(), Event()
     calls = []
 
-    def slow_scan(config, query, cancel):
+    def slow_scan(config, query, cancel, progress=None):
         calls.append(query)
         if query == "old":
             started.set()
@@ -190,6 +190,106 @@ def test_tui_debounce_responsiveness_and_stale_result_guard(project, monkeypatch
                 await pilot.press("escape")
                 await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
                 assert app.navigation.view.kind == "home"
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_live_progress_elapsed_time_stale_messages_and_final_status(project, monkeypatch):
+    config, file = project
+    old_started, new_started = Event(), Event()
+    release_old, release_new = Event(), Event()
+    callbacks = {}
+
+    def controlled_scan(config, query, cancel, progress):
+        callbacks[query] = progress
+        if query == "old":
+            progress(SearchProgress(3, 2, config.roots[0].path, 1))
+            old_started.set()
+            release_old.wait(5)
+            progress(SearchProgress(999, 999, config.roots[0].path))
+            return ScanReport(total=999)
+        progress(SearchProgress(8, 4, config.roots[1].path))
+        new_started.set()
+        release_new.wait(5)
+        return ScanReport((Item(config.roots[1].path / "new.txt", False),), total=4, scanned=8)
+
+    monkeypatch.setattr(main, "scan_names", controlled_scan)
+
+    async def scenario():
+        app = FileFinderApp(file)
+        try:
+            async with app.run_test(size=(110, 40)) as pilot:
+                await wait_until(lambda: app.config is not None)
+                app.query_one(Input).value = "old"
+                await wait_until(lambda: old_started.is_set() and app.navigation.view.progress is not None and app.navigation.view.progress.scanned == 3)
+                old_generation = app.gate.generation
+                status = app.navigation.view.status
+                assert "已掃描 3" in status and "至少 2" in status
+                assert "尚未完成" in status and "命中總數" not in status
+                assert str(config.roots[0].path) in status
+                assert "讀取錯誤 1" in status
+                await asyncio.sleep(0.25)
+                assert app.navigation.view.status != status
+                await pilot.press("ctrl+l")
+                assert isinstance(app.focused, Input)
+                app.query_one(Input).value = "new"
+                await wait_until(lambda: new_started.is_set() and app.navigation.view.progress.found == 4)
+                release_old.set()
+                app.post_message(IOResult(old_generation, "progress", SearchProgress(999, 999)))
+                await pilot.pause()
+                assert app.navigation.view.progress.found == 4
+                assert "999" not in app.navigation.view.status
+                release_new.set()
+                await wait_until(lambda: app.navigation.view.report is not None)
+                finished = app.navigation.view.status
+                assert "命中總數 4" in finished
+                callbacks["new"](SearchProgress(999, 999))
+                await asyncio.sleep(0.25)
+                await pilot.pause()
+                assert app.navigation.view.status == finished
+                assert app.navigation.view.items[0].name == "new.txt"
+                await pilot.press("escape")
+                await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
+                callbacks["new"](SearchProgress(999, 999))
+                await pilot.pause()
+                assert app.navigation.view.kind == "home"
+                assert "999" not in app.navigation.view.status
+        finally:
+            release_old.set()
+            release_new.set()
+
+    asyncio.run(scenario())
+
+
+def test_escape_during_progress_keeps_homepage(project, monkeypatch):
+    _, file = project
+    started, release = Event(), Event()
+
+    def controlled_scan(config, query, cancel, progress):
+        progress(SearchProgress(3, 2, config.roots[0].path))
+        started.set()
+        release.wait(5)
+        progress(SearchProgress(999, 999))
+        return ScanReport(total=999, cancelled=cancel.is_set())
+
+    monkeypatch.setattr(main, "scan_names", controlled_scan)
+
+    async def scenario():
+        app = FileFinderApp(file)
+        try:
+            async with app.run_test(size=(110, 40)) as pilot:
+                await wait_until(lambda: app.config is not None)
+                app.query_one(Input).value = "report"
+                await wait_until(lambda: started.is_set() and app.navigation.view.progress is not None)
+                await pilot.press("escape")
+                await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
+                release.set()
+                await pilot.pause()
+                assert app.navigation.view.kind == "home"
+                assert app.query_one(Input).value == ""
+                assert "999" not in app.navigation.view.status
         finally:
             release.set()
 

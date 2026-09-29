@@ -13,6 +13,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from threading import Event
+from time import monotonic
 from typing import Callable
 
 from textual import events, on, work
@@ -27,6 +28,7 @@ from textual.widgets.option_list import Option
 
 RESULT_LIMIT = 200
 DEBOUNCE_SECONDS = 0.25
+PROGRESS_INTERVAL_SECONDS = 0.2
 REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 EXECUTABLE_SUFFIXES = {
     ".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".psd1", ".vbs",
@@ -161,17 +163,38 @@ def entry_item(entry: os.DirEntry) -> Item | None:
     return Item(Path(entry.path), stat.S_ISDIR(metadata.st_mode))
 
 
-def scan_names(config: Config, query: str, cancel: Event | None = None) -> ScanReport:
+@dataclass(frozen=True)
+class SearchProgress:
+    scanned: int = 0
+    found: int = 0
+    directory: Path | None = None
+    errors: int = 0
+    skipped_links: int = 0
+
+
+def scan_names(config: Config, query: str, cancel: Event | None = None, progress: Callable[[SearchProgress], None] | None = None) -> ScanReport:
     cancel = cancel or Event()
     best: list[tuple[tuple, Item]] = []
     errors: list[str] = []
     visited: set[str] = set()
     total = scanned = skipped_links = 0
     limited = False
+    directory = None
+    last_progress = float("-inf")
     if not query:
         return ScanReport()
     # 根目錄本身也屬於名稱搜尋範圍；重疊根目錄只計算一次。
     stack = [(root.path, True) for root in reversed(config.roots)]
+
+    def publish_progress(force: bool = False) -> None:
+        nonlocal last_progress
+        if progress is None or cancel.is_set():
+            return
+        now = monotonic()
+        # 限制背景訊息頻率；最後一份快照保留實際計數，不建立索引。
+        if force or now - last_progress >= PROGRESS_INTERVAL_SECONDS:
+            last_progress = now
+            progress(SearchProgress(scanned, total, directory, len(errors), skipped_links))
 
     def consider(item: Item) -> None:
         nonlocal total
@@ -190,6 +213,7 @@ def scan_names(config: Config, query: str, cancel: Event | None = None) -> ScanR
         if key in visited:
             continue
         visited.add(key)
+        publish_progress()
         try:
             with os.scandir(directory) as entries:
                 if is_root:
@@ -197,6 +221,7 @@ def scan_names(config: Config, query: str, cancel: Event | None = None) -> ScanR
                 for entry in entries:
                     if cancel.is_set():
                         break
+                    publish_progress()
                     if scanned >= config.max_scan_entries:
                         limited = True
                         break
@@ -219,6 +244,7 @@ def scan_names(config: Config, query: str, cancel: Event | None = None) -> ScanR
                         consider(item)
         except OSError as error:
             errors.append(path_error(directory, error))
+    publish_progress(force=True)
     return ScanReport(tuple(item for _, item in best), total, scanned, tuple(errors), cancel.is_set(), limited, skipped_links)
 
 
@@ -318,6 +344,8 @@ class View:
     report: ScanReport | None = None
     status: str = "準備搜尋"
     selected: int | None = None
+    progress: SearchProgress | None = None
+    search_started: float | None = None
 
 
 class Navigation:
@@ -488,6 +516,7 @@ class FileFinderApp(App):
         yield Static("↑↓ 選取 | Enter 開啟 | F 最愛 | Backspace／Alt+← 返回 | Alt+→ 前進 | Esc 首頁\nCtrl+L 搜尋 | Ctrl+E 錯誤詳情 | Ctrl+Q 結束 | 滑鼠單擊選取並開啟", id="keys", markup=False)
 
     def on_mount(self) -> None:
+        self.set_interval(PROGRESS_INTERVAL_SECONDS, self.refresh_search_progress)
         generation, cancel = self.gate.invalidate()
         self.initialize(generation, cancel)
         self.query_one(Input).focus()
@@ -550,12 +579,30 @@ class FileFinderApp(App):
     def start_search(self, generation: int, query: str, cancel: Event) -> None:
         self.debounce_timer = None
         if self.gate.accepts(generation):
-            self.set_status("正在搜尋三個根目錄…可繼續輸入、Esc 返回首頁或 Ctrl+Q 結束")
+            self.navigation.view.search_started = monotonic()
+            self.navigation.view.progress = SearchProgress()
+            self.refresh_search_progress()
             self.search_worker(generation, query, cancel)
+
+    def refresh_search_progress(self) -> None:
+        view = self.navigation.view
+        if view.kind != "search" or view.report is not None or view.search_started is None:
+            return
+        progress = view.progress or SearchProgress()
+        elapsed = max(0.0, monotonic() - view.search_started)
+        status = f"正在搜尋…耗時 {elapsed:.1f} 秒；已掃描 {progress.scanned} 個項目；目前找到至少 {progress.found} 筆（尚未完成）"
+        if progress.directory is not None:
+            status += f"\n掃描資料夾：{progress.directory}"
+        if progress.errors or progress.skipped_links:
+            status += f"\n讀取錯誤 {progress.errors} 項；已排除 {progress.skipped_links} 個連結／reparse point"
+        self.set_status(status)
 
     @work(thread=True, exclusive=True, group="io")
     def search_worker(self, generation: int, query: str, cancel: Event) -> None:
-        self.post_message(IOResult(generation, "search", scan_names(self.config, query, cancel)))
+        def progress(snapshot: SearchProgress) -> None:
+            self.post_message(IOResult(generation, "progress", snapshot))
+
+        self.post_message(IOResult(generation, "search", scan_names(self.config, query, cancel, progress)))
 
     @work(thread=True, exclusive=True, group="io")
     def load_home(self, generation: int, cancel: Event) -> None:
@@ -570,6 +617,12 @@ class FileFinderApp(App):
         if not self.gate.accepts(message.generation):
             return
         view = self.navigation.view
+        if message.kind == "progress":
+            # 舊請求及已完成搜尋的延遲進度不可覆蓋目前狀態。
+            if view.kind == "search" and view.report is None:
+                view.progress = message.payload
+                self.refresh_search_progress()
+            return
         if message.kind == "initialize":
             self.config, self.favorites, items, error = message.payload
             self.configuration_error = error

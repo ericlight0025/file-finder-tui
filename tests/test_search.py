@@ -107,6 +107,66 @@ def test_pre_cancelled_scan_and_empty_query(project):
     assert scan_names(config, "").total == 0
 
 
+def test_progress_counts_and_errors_cover_three_roots(project):
+    config, _ = project
+    snapshots = []
+    for root in config.roots[:2]:
+        child = root.path / "deep"
+        child.mkdir()
+        (child / "report.txt").touch()
+    config.roots[2].path.rmdir()
+    report = scan_names(config, "rpt", progress=snapshots.append)
+    assert snapshots[0].scanned == snapshots[0].found == 0
+    assert snapshots[0].directory == config.roots[0].path
+    assert snapshots[-1].scanned == report.scanned == 4
+    assert snapshots[-1].found == report.total == 2
+    assert snapshots[-1].errors == len(report.errors) == 1
+    assert snapshots[-1].directory == config.roots[2].path
+    assert not report.complete
+
+
+def test_progress_is_throttled_during_fast_scan(project, monkeypatch):
+    config, _ = project
+    for number in range(50):
+        (config.roots[0].path / f"report{number}.txt").touch()
+    monkeypatch.setattr(main, "monotonic", lambda: 10.0)
+    snapshots = []
+    report = scan_names(config, "report", progress=snapshots.append)
+    assert len(snapshots) == 2
+    assert snapshots[-1].found == report.total == 50
+    assert report == scan_names(config, "report")
+
+
+def test_progress_advances_during_scan_and_stops_after_cancel(project, monkeypatch):
+    config, _ = project
+    for number in range(20):
+        (config.roots[0].path / f"report{number}.txt").touch()
+    clock = [0.0]
+    original = main.entry_item
+    cancel = Event()
+    snapshots = []
+
+    def slow_entry(entry):
+        clock[0] += 0.1
+        return original(entry)
+
+    def progress(snapshot):
+        assert not cancel.is_set()
+        snapshots.append(snapshot)
+        if snapshot.scanned >= 4:
+            cancel.set()
+
+    monkeypatch.setattr(main, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(main, "entry_item", slow_entry)
+    report = scan_names(config, "report", cancel, progress)
+    assert len(snapshots) >= 3
+    assert snapshots[0].scanned == 0
+    assert snapshots[-1].scanned >= 4
+    assert report.scanned < 20
+    assert report.cancelled
+    assert scan_names(config, "report", cancel, lambda snapshot: pytest.fail("取消後不得回報進度")).cancelled
+
+
 def test_generation_protects_against_old_results():
     gate = RequestGate()
     old_generation, old_cancel = gate.invalidate()
