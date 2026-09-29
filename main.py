@@ -591,7 +591,9 @@ class FileFinderApp(App):
             invalid = " [失效／無法讀取]" if item.error else ""
             icon = "📁" if item.is_dir else "📄"
             label = item.label or item.name
-            prompt = f"{icon} {label}{star}{invalid}\n  {item.path.parent}"
+            # 首頁根目錄顯示完整搜尋路徑；檔案與子項目顯示父目錄以區分同名項目。
+            location = item.path if view.kind == "home" and section == 2 else item.path.parent
+            prompt = f"{icon} {label}{star}{invalid}\n  {location}"
             options.append(Option(prompt))
         results = self.query_one(OptionList)
         previous = view.selected

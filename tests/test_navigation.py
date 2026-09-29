@@ -207,6 +207,11 @@ def test_tui_favorites_focus_persistence_and_return_home(project):
             await wait_until(lambda: app.config is not None)
             assert app.navigation.view.items[1].path == deep
             results = app.query_one(OptionList)
+            for item, option in zip(app.navigation.view.items, results.options):
+                if item is not None and item.label == config.roots[0].name:
+                    assert str(config.roots[0].path) == str(option.prompt).splitlines()[-1].strip()
+                elif item is not None and item.path == deep:
+                    assert str(deep.parent) == str(option.prompt).splitlines()[-1].strip()
             results.focus()
             results.highlighted = 1
             await pilot.press("enter")
