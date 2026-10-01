@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from main import Config, Root
+from backend import Config, Root
 
 
 @pytest.fixture

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import main
-from main import Favorites, path_key
+import backend
+from backend import Favorites, path_key
 
 
 def test_add_reload_and_remove(tmp_path):
@@ -63,7 +63,7 @@ def test_missing_favorite_retained_until_explicit_remove(tmp_path):
     folder.rmdir()
     reloaded = Favorites(store.file)
     assert reloaded.paths == [folder]
-    assert main.validate_folder(folder)
+    assert backend.validate_folder(folder)
     assert not reloaded.toggle(folder)
 
 
@@ -94,7 +94,7 @@ def test_atomic_failure_preserves_original_and_memory(tmp_path, monkeypatch):
         assert json.loads(Path(source).read_text(encoding="utf-8")) == [str(first), str(second)]
         raise PermissionError("模擬原子替換失敗")
 
-    monkeypatch.setattr(main.os, "replace", failed_replace)
+    monkeypatch.setattr(backend.os, "replace", failed_replace)
     with pytest.raises(ValueError, match="保存失敗"):
         store.toggle(second)
     assert store.paths == [first]
@@ -106,7 +106,7 @@ def test_save_uses_replace_after_fsync(tmp_path, monkeypatch):
     folder = tmp_path / "folder"
     folder.mkdir()
     calls = []
-    fsync, replace = main.os.fsync, main.os.replace
+    fsync, replace = backend.os.fsync, backend.os.replace
 
     def record_fsync(fd):
         calls.append("fsync")
@@ -116,7 +116,7 @@ def test_save_uses_replace_after_fsync(tmp_path, monkeypatch):
         calls.append("replace")
         return replace(source, destination)
 
-    monkeypatch.setattr(main.os, "fsync", record_fsync)
-    monkeypatch.setattr(main.os, "replace", record_replace)
+    monkeypatch.setattr(backend.os, "fsync", record_fsync)
+    monkeypatch.setattr(backend.os, "replace", record_replace)
     Favorites(tmp_path / "favorites.json").toggle(folder)
     assert calls == ["fsync", "replace"]
