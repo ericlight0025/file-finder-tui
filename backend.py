@@ -20,6 +20,49 @@ from typing import Callable, Iterator
 RESULT_LIMIT = 200
 PROGRESS_INTERVAL_SECONDS = 0.2
 REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+MAX_JSON_BYTES = 2 * 1024 * 1024
+BIDI_CONTROLS = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+
+
+def display_text(value: object, *, multiline: bool = False) -> str:
+    """讓外部文字中的終端控制碼與方向控制字元可見，不改動實際路徑。"""
+    def visible(character: str) -> str:
+        code = ord(character)
+        if character == "\n" and multiline:
+            return character
+        if code < 32 or 0x7F <= code <= 0x9F:
+            return f"\\x{code:02x}"
+        if code in BIDI_CONTROLS or code in {0x2028, 0x2029} or 0xD800 <= code <= 0xDFFF:
+            return f"\\u{code:04x}"
+        return character
+    return "".join(visible(character) for character in str(value))
+
+
+def valid_path_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and "\x00" not in value and not any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def read_json(file: Path) -> object:
+    """有界讀取本機 JSON；格式、深度或編碼異常由呼叫者提供錯誤提示。"""
+    with file.open("rb") as stream:
+        data = stream.read(MAX_JSON_BYTES + 1)
+    if len(data) > MAX_JSON_BYTES:
+        raise ValueError("JSON 超過 2 MiB 大小限制")
+    try:
+        return json.loads(data.decode("utf-8-sig"))
+    except RecursionError as error:
+        raise ValueError("JSON 巢狀層級過深") from error
+
+
+class ExcludedLinkError(OSError):
+    """明確拒絕直接路徑上的符號連結及 Windows reparse point。"""
+
+
+def plain_metadata(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & REPARSE_POINT:
+        raise ExcludedLinkError(str(path))
+    return metadata
 
 
 def path_key(path: str | Path) -> str:
@@ -28,7 +71,9 @@ def path_key(path: str | Path) -> str:
 
 
 def path_error(path: str | Path, error: OSError) -> str:
-    if isinstance(error, PermissionError):
+    if isinstance(error, ExcludedLinkError):
+        reason = "不支援符號連結／reparse point"
+    elif isinstance(error, PermissionError):
         reason = "沒有讀取權限"
     elif isinstance(error, FileNotFoundError):
         reason = "路徑不存在或網路磁碟未連線"
@@ -36,7 +81,7 @@ def path_error(path: str | Path, error: OSError) -> str:
         reason = "不是資料夾"
     else:
         reason = f"無法讀取，請檢查磁碟或網路連線（系統代碼 {error.winerror if hasattr(error, 'winerror') else error.errno}）"
-    return f"{path}：{reason}"
+    return f"{display_text(path)}：{reason}"
 
 
 @dataclass(frozen=True)
@@ -53,19 +98,22 @@ class Config:
 
 def load_config(path: Path) -> Config:
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        data = read_json(path)
     except FileNotFoundError as error:
-        raise ValueError(f"無法讀取 config.json，設定檔尚未建立：{path}\n請參考 config.example.json 建立設定檔，填入三個搜尋資料夾後重啟。") from error
+        raise ValueError(f"無法讀取 config.json，設定檔尚未建立：{display_text(path)}\n請參考 config.example.json 建立設定檔，填入三個搜尋資料夾後重啟。") from error
     except (OSError, ValueError) as error:
-        raise ValueError(f"無法讀取 config.json，請檢查檔案與 JSON 格式：{path}") from error
+        raise ValueError(f"無法讀取 config.json，請檢查檔案、JSON 格式及 2 MiB 大小限制：{display_text(path)}") from error
     roots = data.get("roots") if isinstance(data, dict) else None
     if not isinstance(roots, list) or len(roots) != 3:
         raise ValueError("config.json 的 roots 必須剛好包含三個搜尋根目錄。")
     parsed = []
     for index, root in enumerate(roots, 1):
-        if not isinstance(root, dict) or not isinstance(root.get("path"), str) or not root["path"].strip():
-            raise ValueError(f"第 {index} 個根目錄必須設定非空白 path。")
-        directory = Path(root["path"]).expanduser()
+        if not isinstance(root, dict) or not valid_path_text(root.get("path")):
+            raise ValueError(f"第 {index} 個根目錄必須設定有效、非空白的 path。")
+        try:
+            directory = Path(root["path"]).expanduser()
+        except (ValueError, RuntimeError) as error:
+            raise ValueError(f"第 {index} 個根目錄無法解析，請使用完整絕對路徑。") from error
         if not directory.is_absolute():
             raise ValueError(f"第 {index} 個根目錄請使用完整絕對路徑。")
         name = root.get("name", f"根目錄 {index}")
@@ -163,20 +211,22 @@ def entry_item(entry: os.DirEntry) -> Item | None:
 
 def path_item(path: Path, label: str = "", require_dir: bool = False, index: DirectoryIndex | None = None) -> Item:
     """取得首頁／收藏項目的類型與時間；失效路徑仍保留供移除。"""
-    saved = index.directory_item(path) if index is not None else None
-    if saved is not None:
-        return replace(saved, label=label)
     try:
-        metadata = path.stat()
+        metadata = plain_metadata(path)
+        saved = index.directory_item(path) if index is not None and stat.S_ISDIR(metadata.st_mode) else None
+        if saved is not None:
+            return replace(saved, label=label)
         is_dir = stat.S_ISDIR(metadata.st_mode)
         if require_dir and not is_dir:
-            return Item(path, False, label, f"{path}：不是資料夾", metadata.st_mtime)
+            return Item(path, False, label, f"{display_text(path)}：不是資料夾", metadata.st_mtime)
         if not is_dir and not stat.S_ISREG(metadata.st_mode):
-            return Item(path, False, label, f"{path}：不是一般檔案或資料夾", metadata.st_mtime)
+            return Item(path, False, label, f"{display_text(path)}：不是一般檔案或資料夾", metadata.st_mtime)
         error = validate_folder(path) if is_dir else ""
         return Item(path, is_dir, label, error, metadata.st_mtime)
     except OSError as error:
         return Item(path, require_dir, label, path_error(path, error))
+    except ValueError:
+        return Item(path, require_dir, label, f"{display_text(path)}：路徑格式錯誤")
 
 
 @dataclass(frozen=True)
@@ -254,8 +304,8 @@ class DirectoryIndex:
                 return
             records: list[Item | str | None] = []
             complete = failed = False
+            metadata = plain_metadata(directory)
             with os.scandir(directory) as entries:
-                metadata = directory.stat()
                 root = Item(directory, True, modified_at=metadata.st_mtime)
 
                 def read_entries() -> Iterator[Item | str | None]:
@@ -357,6 +407,8 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
                         stack.append((item.path, False))
                     else:
                         consider(item)
+        except ExcludedLinkError:
+            skipped_links += 1
         except OSError as error:
             errors.append(path_error(directory, error))
     publish_progress(force=True)
@@ -372,6 +424,10 @@ def browse_folder(directory: Path, cancel: Event | None = None, index: Directory
     scanned = skipped_links = 0
     cached_directories = read_directories = 0
     try:
+        # 瀏覽是直接操作；即使已有快取，也拒絕被替換成連結的目標。
+        metadata = plain_metadata(directory)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(str(directory))
         with index.listing(directory, cancel) as listing:
             if listing.root is not None and track_cache:
                 cached_directories = int(listing.cached)
@@ -386,18 +442,27 @@ def browse_folder(directory: Path, cancel: Event | None = None, index: Directory
                     skipped_links += 1
                 else:
                     items.append(item)
+    except ExcludedLinkError:
+        skipped_links += 1
     except OSError as error:
         errors.append(path_error(directory, error))
+    except ValueError:
+        errors.append(f"{display_text(directory)}：路徑格式錯誤")
     items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
     return ScanReport(tuple(items), len(items), scanned, tuple(errors), cancel.is_set(), False, skipped_links, cached_directories, read_directories)
 
 
 def validate_folder(path: Path) -> str:
     try:
+        metadata = plain_metadata(path)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(str(path))
         with os.scandir(path):
             pass
     except OSError as error:
         return path_error(path, error)
+    except ValueError:
+        return f"{display_text(path)}：路徑格式錯誤"
     return ""
 
 
@@ -407,8 +472,8 @@ class Favorites:
         self.paths: list[Path] = []
         self.error = ""
         try:
-            data = json.loads(file.read_text(encoding="utf-8-sig"))
-            if not isinstance(data, list) or any(not isinstance(path, str) or not Path(path).is_absolute() for path in data):
+            data = read_json(file)
+            if not isinstance(data, list) or any(not valid_path_text(path) or not Path(path).is_absolute() for path in data):
                 raise ValueError("最愛格式錯誤")
             keys = set()
             for value in data:
@@ -418,7 +483,7 @@ class Favorites:
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
-            self.error = f"無法讀取最愛檔案，收藏已停用；請修正後重啟：{file}"
+            self.error = f"無法讀取最愛檔案，收藏已停用；請檢查格式、路徑及 2 MiB 大小限制後重啟：{display_text(file)}"
 
     def contains(self, path: Path) -> bool:
         return any(path_key(saved) == path_key(path) for saved in self.paths)
@@ -426,19 +491,23 @@ class Favorites:
     def toggle(self, path: Path) -> bool:
         if self.error:
             raise ValueError(self.error)
+        if not valid_path_text(str(path)) or not path.is_absolute():
+            raise ValueError("收藏必須使用有效的完整絕對路徑。")
         exists = self.contains(path)
         if not exists:
             item = path_item(path)
             if item.error:
                 raise ValueError(f"只能收藏可讀取的一般檔案或資料夾。{item.error}")
         updated = [saved for saved in self.paths if path_key(saved) != path_key(path)] if exists else [*self.paths, path]
+        serialized = json.dumps([str(saved) for saved in updated], ensure_ascii=False, indent=2) + "\n"
+        if len(serialized.encode("utf-8")) > MAX_JSON_BYTES:
+            raise ValueError("最愛保存失敗：超過 2 MiB 大小限制，原有收藏保持不變。")
         temporary = None
         try:
             # 暫存檔與目的檔位於同一資料夾，成功寫入後再原子替換。
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.file.parent, prefix=".favorites-", suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
-                json.dump([str(saved) for saved in updated], stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
+                stream.write(serialized)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.file)
@@ -487,11 +556,13 @@ def search_favorites(favorites: Favorites, query: str, cancel: Event, index: Dir
 def open_file(path: Path, opener: Callable[[str], None] | None) -> str:
     """要求作業系統開啟單一檔案，回傳前端可顯示的結果訊息。"""
     try:
-        if not path.is_file():
+        if not stat.S_ISREG(plain_metadata(path).st_mode):
             raise FileNotFoundError(str(path))
         if opener is None:
             return "此工具的檔案開啟功能僅支援 Windows。"
         opener(str(path))
-        return f"已要求 Windows 開啟：{path}"
+        return f"已要求 Windows 開啟：{display_text(path)}"
     except OSError as error:
         return path_error(path, error)
+    except ValueError:
+        return f"{display_text(path)}：路徑格式錯誤"
