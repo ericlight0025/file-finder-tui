@@ -181,6 +181,7 @@ file-finder-tui/
 ├── favorites.json      # 本機收藏，Git 忽略
 ├── requirements.txt
 ├── README.md
+├── LICENSE             # MIT 授權條款
 ├── .gitignore
 └── tests/
     ├── conftest.py
@@ -194,3 +195,9 @@ file-finder-tui/
 ```
 
 先調整三個根目錄並執行 `--check`，再啟動 TUI。實際 Windows Terminal 顯示、使用者網路磁碟與 Windows 關聯程式開啟行為可依快捷鍵表進行人工驗收；自動測試不會修改你的原始搜尋檔案。
+
+## 授權
+
+本專案採用 MIT License，完整授權條款見 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 ericlight0025
