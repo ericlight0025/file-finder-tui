@@ -457,7 +457,7 @@ def test_tui_invalid_config_is_displayed_without_crash(tmp_path):
     asyncio.run(scenario())
 
 
-def test_tui_mouse_click_enters_folder(project):
+def test_tui_mouse_single_click_selects_and_double_click_enters_folder(project):
     config, file = project
 
     async def scenario():
@@ -468,6 +468,10 @@ def test_tui_mouse_click_enters_folder(project):
             # 根目錄直接列在資料夾分頁，每個項目顯示名稱、更新時間與路徑。
             clicked = await pilot.click("#results", offset=(5, 1))
             assert clicked
+            await pilot.pause()
+            assert app.navigation.view.kind == "home"
+            assert app.query_one(OptionList).highlighted == 0
+            assert await pilot.double_click("#results", offset=(5, 1))
             await wait_until(lambda: app.navigation.view.kind == "browse" and app.navigation.view.report is not None)
             assert app.navigation.view.directory == config.roots[0].path
             await pilot.press("backspace")

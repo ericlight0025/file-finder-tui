@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+from collections.abc import Sequence
 import os
 from pathlib import Path
 import sys
@@ -11,11 +13,15 @@ from threading import Event
 from time import monotonic
 from typing import Callable
 
+from rich.text import Text
+
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
+from textual.geometry import Region, Size
+from textual.strip import Strip
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, Input, OptionList, Static, Tab, Tabs
@@ -146,6 +152,110 @@ class FavoriteResult(Message):
         self.status = status
 
 
+class IndexChecked(Message):
+    def __init__(self, sequence: int, report: backend.IndexCheck):
+        super().__init__()
+        self.sequence, self.report = sequence, report
+
+
+class LazyOptions(Sequence):
+    """只為畫面或按鍵實際存取的項目建立 Option。"""
+    def __init__(self, owner: FileList):
+        self.owner = owner
+
+    def __len__(self):
+        return len(self.owner.items)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        cache = self.owner.option_cache
+        if index not in cache:
+            item = self.owner.items[index]
+            cache[index] = Option(self.owner.format_item(item) if item is not None else "", disabled=item is None)
+            if len(cache) > 128:
+                cache.popitem(last=False)
+        cache.move_to_end(index)
+        return cache[index]
+
+
+class FileList(OptionList):
+    """固定列高的虛擬清單，繪製成本取決於可見列數。"""
+    def __init__(self, **kwargs):
+        self.items = ()
+        self.option_cache = OrderedDict()
+        self.row_height = 4
+        self.format_item = lambda item: ""
+        super().__init__(**kwargs)
+
+    def set_items(self, items, formatter, row_height, selected=None):
+        self.highlighted = None
+        self.items, self.format_item, self.row_height = items, formatter, row_height
+        self.option_cache.clear()
+        self._options = LazyOptions(self)
+        self.scroll_y = 0
+        self._update_lines()
+        self.highlighted = selected if selected is not None and 0 <= selected < len(items) else None
+        if self.highlighted is None and items:
+            self.action_first()
+        self.refresh()
+
+    def _update_lines(self):
+        width = max(0, self.scrollable_content_region.width)
+        size = Size(width, len(self.items) * self.row_height)
+        if size != self.virtual_size:
+            self.virtual_size = size
+            self._scroll_update(size)
+
+    def get_content_width(self, container, viewport):
+        return container.width
+
+    def get_content_height(self, container, viewport, width):
+        return len(self.items) * self.row_height
+
+    def scroll_to_highlight(self, top=False):
+        if self.highlighted is not None and self.is_mounted:
+            self.scroll_to_region(Region(0, self.highlighted * self.row_height, self.scrollable_content_region.width, self.row_height), force=True, animate=False, top=top, immediate=True)
+
+    def _move_page(self, direction):
+        if self.items:
+            step = max(1, self.scrollable_content_region.height // self.row_height)
+            self.highlighted = max(0, min(len(self.items) - 1, (self.highlighted or 0) + direction * step))
+
+    def render_line(self, y):
+        width = self.scrollable_content_region.width
+        index, offset = divmod(self.scroll_offset.y + y, self.row_height)
+        if not 0 <= index < len(self.items):
+            return Strip.blank(width, self.get_visual_style("option-list--option").rich_style)
+        option = self.options[index]
+        component = "option-list--option-disabled" if option.disabled else ("option-list--option-highlighted" if index == self.highlighted else ("option-list--option-hover" if index == self._mouse_hovering_over else ""))
+        style = self.get_visual_style("option-list--option", *([component] if component else [])).rich_style
+        lines = str(option.prompt).splitlines()
+        text = Text(" " + (lines[offset] if offset < len(lines) else ""), style=style, no_wrap=True, overflow="ellipsis", end="")
+        text.truncate(max(0, width - 1), overflow="ellipsis", pad=True)
+        strip = Strip(self.app.console.render(text, self.app.console.options.update(width=max(1, width))))
+        return strip.adjust_cell_length(width, style).apply_meta({"option": index})
+
+    async def _on_click(self, event: events.Click):
+        index = event.style.meta.get("option")
+        if index is not None and 0 <= index < len(self.items) and self.items[index] is not None:
+            self.focus()
+            self.highlighted = index
+            if event.chain == 2:
+                self.action_select()
+            event.stop()
+            event.prevent_default()
+
+    def _on_mouse_move(self, event: events.MouseMove):
+        super()._on_mouse_move(event)
+        index = event.style.meta.get("option")
+        self.tooltip = display_text(self.items[index].name) if index is not None and 0 <= index < len(self.items) and self.items[index] is not None else None
+
+
 class ConfirmOpen(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "取消")]
     DEFAULT_CSS = """
@@ -237,6 +347,8 @@ class FileFinderApp(App):
         Binding("alt+2", "menu('favorites')", "我的最愛", priority=True),
         Binding("ctrl+tab", "next_menu", "切換分頁", priority=True),
         Binding("f5", "refresh", "更新", priority=True),
+        Binding("ctrl+f5", "rebuild", "重建索引", priority=True),
+        Binding("ctrl+o", "containing_folder", "所在資料夾", priority=True),
         Binding("backspace", "back", "返回", show=False),
     ]
 
@@ -255,7 +367,10 @@ class FileFinderApp(App):
         self.navigation = self.navigations[self.active_menu]
         self.menu_inputs = {"folders": "", "favorites": ""}
         self.gate = RequestGate()
-        self.directory_index = backend.DirectoryIndex()
+        self.directory_index = backend.DirectoryIndex(self.config_path.with_name(".file-finder-index.sqlite3"))
+        self.index_sequence = 0
+        self.index_cancel = Event()
+        self.index_checking = False
         self.debounce_timer = None
         self.favorite_busy = False
         self.last_escape_at: float | None = None
@@ -266,9 +381,9 @@ class FileFinderApp(App):
         yield Tabs(Tab("資料夾", id="folders"), Tab("★ 我的最愛", id="favorites"), active="folders", id="menu", disabled=True)
         yield Input(placeholder="搜尋名稱；空白分隔的關鍵字須全部符合…", id="search", select_on_focus=False)
         yield Static(f"首頁\n設定檔：{display_text(self.config_path)}", id="location", markup=False)
-        yield OptionList(id="results", markup=False)
-        yield Static("正在驗證設定與根目錄…", id="status", markup=False)
-        yield Static("直接打字搜尋 | ↑↓ 選取 | Enter 開啟 | Ctrl+F 收藏／移除 | F5 更新 | Backspace／Alt+← 返回 | Alt+→ 前進\nAlt+1 資料夾 | Alt+2 我的最愛 | Ctrl+Tab 切分頁 | Esc 上一層／連按兩次回首頁 | Ctrl+L 搜尋 | Ctrl+E 錯誤 | Ctrl+Q 結束", id="keys", markup=False)
+        yield FileList(id="results", markup=False)
+        yield Static("正在讀取設定與保存的索引…", id="status", markup=False)
+        yield Static("↑↓／單擊 選取 | Enter／雙擊 開啟 | Ctrl+F 最愛 | Ctrl+O 所在資料夾\n直接打字搜尋 | F5 更新 | Ctrl+F5 重建 | Esc 上一層／連按回首頁 | Ctrl+Q 結束", id="keys", markup=False)
 
     def on_mount(self) -> None:
         self.set_interval(PROGRESS_INTERVAL_SECONDS, self.refresh_search_progress)
@@ -281,6 +396,7 @@ class FileFinderApp(App):
         try:
             config = backend.load_config(self.config_path)
             favorites = Favorites(self.favorites_path)
+            self.directory_index.load(tuple(root.path for root in config.roots) + tuple(favorites.paths), cancel)
             payload = (config, favorites, backend.list_home_items(config, favorites, cancel, index=self.directory_index), "")
         except ValueError as error:
             payload = (None, None, (), str(error))
@@ -351,6 +467,8 @@ class FileFinderApp(App):
         else:
             report = backend.scan_names(self.config, query, cancel, progress, self.directory_index)
         self.post_message(IOResult(generation, "search", report))
+        self.directory_index.flush()
+        self.post_message(IOResult(generation, "storage", None))
 
     @work(thread=True, exclusive=True, group="io")
     def load_home(self, generation: int, cancel: Event, menu: str) -> None:
@@ -359,6 +477,8 @@ class FileFinderApp(App):
     @work(thread=True, exclusive=True, group="io")
     def load_folder(self, generation: int, directory: Path, cancel: Event) -> None:
         self.post_message(IOResult(generation, "browse", backend.browse_folder(directory, cancel, self.directory_index)))
+        self.directory_index.flush()
+        self.post_message(IOResult(generation, "storage", None))
 
     @on(IOResult)
     def on_io_result(self, message: IOResult) -> None:
@@ -388,9 +508,35 @@ class FileFinderApp(App):
         elif message.kind == "open":
             self.set_status(message.payload)
             return
+        elif message.kind == "storage":
+            self.set_status(view.status)
+            return
+        elif message.kind == "index-refresh":
+            self.restore_navigation_view(message.generation, self.gate.cancel, refresh=True)
+            return
         self.render_view()
         if message.kind == "initialize" and self.config and self.query_one(Input).value.strip():
             self.search_changed(self.query_one(Input).value)
+        if message.kind == "initialize" and self.config and self.directory_index.unverified_count:
+            self.index_checking = True
+            self.set_status(self.navigation.view.status)
+            self.check_index(self.index_sequence, self.index_cancel)
+
+    @work(thread=True, exclusive=True, group="index-check")
+    def check_index(self, sequence: int, cancel: Event) -> None:
+        report = self.directory_index.check_changes(cancel)
+        self.directory_index.flush()
+        self.post_message(IndexChecked(sequence, report))
+
+    def on_index_checked(self, message: IndexChecked) -> None:
+        if message.sequence != self.index_sequence or message.report.cancelled:
+            return
+        self.index_checking = False
+        if message.report.changed:
+            generation, cancel = self.invalidate()
+            self.restore_navigation_view(generation, cancel, refresh=True)
+        else:
+            self.set_status(self.navigation.view.status)
 
     def home_status(self, items: tuple[Item | None, ...]) -> str:
         invalid = [item.error for item in items if item is not None and item.error]
@@ -419,35 +565,35 @@ class FileFinderApp(App):
 
     def set_status(self, text: str) -> None:
         self.navigation.view.status = text
-        self.query_one("#status", Static).update("狀態：" + display_text(text, multiline=True))
+        shown = "狀態：" + display_text(text, multiline=True)
+        if self.index_checking:
+            shown += "\n已載入保存的索引，背景核對資料夾變動中…"
+        if self.directory_index.error:
+            shown += "\n" + self.directory_index.error
+        self.query_one("#status", Static).update(shown)
 
     def render_view(self) -> None:
         view = self.navigation.view
-        options = []
-        for item in view.items:
-            if item is None:
-                options.append(Option("", disabled=True))
-                continue
-            star = " ★" if self.favorites and self.favorites.contains(item.path) else ""
+        favorite_keys = {backend.path_key(path) for path in tuple(self.favorites.paths)} if self.favorites else set()
+        kind, menu = view.kind, self.active_menu
+
+        def format_item(item):
+            star = " ★" if backend.path_key(item.path) in favorite_keys else ""
             invalid = " [失效／無法讀取]" if item.error else ""
             icon = "📁" if item.is_dir else "📄"
             label = display_text(item.label or item.name)
             # 首頁根目錄顯示完整搜尋路徑；檔案與子項目顯示父目錄以區分同名項目。
-            location = item.path if view.kind == "home" and self.active_menu == "folders" else item.path.parent
+            location = item.path if kind == "home" and menu == "folders" else item.path.parent
             prompt = f"{icon} {label}{star}{invalid}\n  更新：{item.modified_text}"
-            if view.kind != "browse":
+            if kind != "browse":
                 # 同一資料夾內的路徑只顯示在上方；跨目錄搜尋仍保留路徑以辨識同名檔。
                 prompt += f"\n  {display_text(location)}"
             # 留白屬於同一筆選項，方向鍵不會選到額外的空白列。
             prompt += "\n "
-            options.append(Option(prompt))
-        results = self.query_one(OptionList)
-        previous = view.selected
-        results.clear_options().add_options(options)
-        if previous is not None and previous < len(view.items) and view.items[previous] is not None:
-            results.highlighted = previous
-        elif options:
-            results.action_first()
+            return prompt
+
+        results = self.query_one(FileList)
+        results.set_items(view.items, format_item, 3 if kind == "browse" else 4, view.selected)
         view.selected = results.highlighted
         scope = "我的最愛名稱" if self.active_menu == "favorites" else "固定三個根目錄"
         location = display_text(view.directory) if view.kind == "browse" else (f"搜尋：{display_text(view.query)}（{scope}；關鍵字全部符合）" if view.kind == "search" else f"{'我的最愛' if self.active_menu == 'favorites' else '搜尋根目錄'}\n設定檔：{display_text(self.config_path)}")
@@ -547,6 +693,19 @@ class FileFinderApp(App):
         status = backend.open_file(path, self.opener)
         self.post_message(IOResult(generation, "open", status))
 
+    def action_containing_folder(self) -> None:
+        if isinstance(self.screen, ModalScreen) or not isinstance(self.focused, FileList):
+            return
+        selected = self.focused.highlighted
+        if selected is not None and selected < len(self.navigation.view.items):
+            item = self.navigation.view.items[selected]
+            if item is not None:
+                self.open_parent_worker(self.gate.generation, item.path)
+
+    @work(thread=True, group="open")
+    def open_parent_worker(self, generation: int, path: Path) -> None:
+        self.post_message(IOResult(generation, "open", backend.open_containing_folder(path, self.opener)))
+
     def action_focus_search(self) -> None:
         if not isinstance(self.screen, ModalScreen):
             self.query_one(Input).focus()
@@ -557,16 +716,37 @@ class FileFinderApp(App):
             return
         view = self.navigation.view
         generation, cancel = self.invalidate()
-        self.directory_index.invalidate(view.directory if view.kind == "browse" else None)
-        if view.kind == "browse":
-            view.report = None
-            self.set_status("正在更新目前資料夾…")
-            self.load_folder(generation, view.directory, cancel)
-        elif view.kind == "search":
-            view.report = None
-            self.start_search(generation, view.query, cancel)
-        else:
-            self.load_home(generation, cancel, self.active_menu)
+        self.index_cancel.set()
+        self.index_sequence += 1
+        self.index_checking = False
+        view.report = None
+        view.search_started = None
+        view.progress = None
+        self.set_status("正在核對變動並增量更新索引…")
+        self.refresh_index(generation, cancel, view.directory if view.kind == "browse" else None, view.kind != "home")
+
+    @work(thread=True, exclusive=True, group="io")
+    def refresh_index(self, generation: int, cancel: Event, directory: Path | None, refresh_times: bool) -> None:
+        self.directory_index.check_changes(cancel, directory, refresh_times=refresh_times)
+        self.directory_index.flush()
+        self.post_message(IOResult(generation, "index-refresh", None))
+
+    def action_rebuild(self) -> None:
+        if isinstance(self.screen, ModalScreen) or self.config is None:
+            return
+        generation, cancel = self.invalidate()
+        self.index_cancel.set()
+        self.index_sequence += 1
+        self.index_checking = False
+        self.directory_index.invalidate()
+        self.navigation.view.report = None
+        self.set_status("正在完整重建索引…")
+        self.restore_navigation_view(generation, cancel, refresh=True)
+        self.flush_index()
+
+    @work(thread=True, exclusive=True, group="index-save")
+    def flush_index(self) -> None:
+        self.directory_index.flush()
 
     def action_escape(self) -> None:
         """單次退回一個瀏覽層級；0.5 秒內連按兩次才直接回分頁首頁。"""
@@ -630,7 +810,7 @@ class FileFinderApp(App):
         self.navigation.forward()
         self.restore_navigation_view(generation, cancel)
 
-    def restore_navigation_view(self, generation: int, cancel: Event) -> None:
+    def restore_navigation_view(self, generation: int, cancel: Event, refresh: bool = False) -> None:
         view = self.navigation.view
         self.set_input(view.query)
         self.render_view()
@@ -639,7 +819,8 @@ class FileFinderApp(App):
             self.load_folder(generation, view.directory, cancel)
         elif view.kind == "home":
             self.load_home(generation, cancel, self.active_menu)
-        elif view.report is None:
+        elif view.report is None or refresh:
+            view.report = None
             self.start_search(generation, view.query, cancel)
 
     def current_errors(self) -> tuple[str, ...]:
@@ -701,8 +882,13 @@ class FileFinderApp(App):
 
     def action_quit(self) -> None:
         self.invalidate()
+        self.index_cancel.set()
         self.gate.cancel.set()
         self.exit()
+
+    def on_unmount(self) -> None:
+        self.index_cancel.set()
+        self.gate.cancel.set()
 
 
 def main() -> int:

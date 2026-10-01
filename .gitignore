@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .favorites-*.tmp
+.file-finder-index.sqlite3*
 
 # 個人搜尋路徑與收藏只保存在本機。
 /config.json

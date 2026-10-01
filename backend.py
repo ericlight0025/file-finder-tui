@@ -6,6 +6,7 @@ import bisect
 import json
 import ntpath
 import os
+import sqlite3
 import stat
 import tempfile
 from contextlib import contextmanager
@@ -21,6 +22,8 @@ RESULT_LIMIT = 200
 PROGRESS_INTERVAL_SECONDS = 0.2
 REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_CACHE_RECORD_BYTES = 64 * 1024 * 1024
+MAX_RESTORED_ENTRIES = 1_000_000
 BIDI_CONTROLS = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
 
 
@@ -245,6 +248,19 @@ class DirectorySnapshot:
     """保存一次完整枚舉的所有名稱與修改時間，不受 200 筆結果上限影響。"""
     root: Item
     entries: tuple[Item | str | None, ...]
+    signature: tuple[int, ...] = ()
+
+
+def directory_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_dev, metadata.st_ino)
+
+
+@dataclass(frozen=True)
+class IndexCheck:
+    checked: int = 0
+    changed: int = 0
+    errors: tuple[str, ...] = ()
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,13 +271,204 @@ class DirectoryListing:
 
 
 class DirectoryIndex:
-    """本次執行共用的記憶體索引；每個完整資料夾只枚舉一次，F5 才失效。"""
-    def __init__(self):
+    """共用名稱索引；可保存至本機 SQLite，核對時只重讀變動的資料夾。"""
+    def __init__(self, file: Path | None = None):
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._locks: dict[str, Lock] = {}
         self._guard = Lock()
         self._generation = 0
         self._versions: dict[str, int] = {}
+        self.file = file
+        self.error = ""
+        self._database_lock = Lock()
+        self._pending: dict[str, DirectorySnapshot | None] = {}
+        self._reset_pending = False
+        self._unverified: set[str] = set()
+
+    @property
+    def unverified_count(self) -> int:
+        with self._guard:
+            return len(self._unverified)
+
+    def _connect(self) -> sqlite3.Connection:
+        try:
+            metadata = plain_metadata(self.file)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("索引路徑不是一般檔案")
+        except FileNotFoundError:
+            pass
+        connection = sqlite3.connect(self.file, timeout=2)
+        try:
+            # 不覆寫不屬於本程式、版本不符或損壞的資料庫。
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if tables and not {"finder_meta", "finder_directories"}.issubset(tables):
+                raise ValueError("索引資料庫格式不符")
+            connection.execute("CREATE TABLE IF NOT EXISTS finder_meta (version INTEGER NOT NULL)")
+            version = connection.execute("SELECT version FROM finder_meta").fetchone()
+            if version is None:
+                connection.execute("INSERT INTO finder_meta VALUES (1)")
+            elif version != (1,):
+                raise ValueError("索引版本不符")
+            connection.execute("CREATE TABLE IF NOT EXISTS finder_directories (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            connection.commit()
+            return connection
+        except Exception:
+            connection.close()
+            raise
+
+    def _storage_error(self) -> None:
+        self.error = "索引快取無法讀寫，已改用記憶體索引；搜尋仍可使用。"
+
+    def load(self, scopes: tuple[Path, ...], cancel: Event) -> int:
+        """只還原本次搜尋／收藏範圍的完整目錄；磁碟核對在背景另行執行。"""
+        if self.file is None or self.error:
+            return 0
+        prefixes = tuple(path_key(scope).rstrip("\\") for scope in scopes)
+        restored = 0
+        restored_entries = 0
+        try:
+            with self._database_lock:
+                connection = self._connect()
+                try:
+                    # 每份快取最多 64 MiB；避免異常快取造成無界單次讀取。
+                    for (key,) in connection.execute("SELECT key FROM finder_directories WHERE typeof(key) = 'text' AND typeof(payload) = 'text' AND length(CAST(payload AS BLOB)) <= ?", (MAX_CACHE_RECORD_BYTES,)):
+                        if cancel.is_set():
+                            break
+                        if not any(key == prefix or key.startswith(prefix + "\\") for prefix in prefixes):
+                            continue
+                        payload = connection.execute("SELECT payload FROM finder_directories WHERE key = ?", (key,)).fetchone()[0]
+                        try:
+                            data = json.loads(payload)
+                            directory, modified, signature, records = data
+                            if not valid_path_text(directory) or not Path(directory).is_absolute() or path_key(directory) != key:
+                                raise ValueError("無效目錄")
+                            if not isinstance(signature, list) or len(signature) != 4 or any(type(value) is not int for value in signature):
+                                raise ValueError("無效目錄時間")
+                            if not isinstance(records, list):
+                                raise ValueError("無效項目")
+                            if len(records) > MAX_RESTORED_ENTRIES - restored_entries:
+                                continue
+                            root = Item(Path(directory), True, modified_at=self._timestamp(modified))
+                            entries = []
+                            for record in records:
+                                if cancel.is_set():
+                                    return restored
+                                if record is None:
+                                    entries.append(None)
+                                    continue
+                                path, is_dir, modified_at = record
+                                if not valid_path_text(path) or not Path(path).is_absolute() or path_key(Path(path).parent) != key or type(is_dir) is not bool:
+                                    raise ValueError("無效子項目")
+                                entries.append(Item(Path(path), is_dir, modified_at=self._timestamp(modified_at)))
+                            snapshot = DirectorySnapshot(root, tuple(entries), tuple(signature))
+                        except (ValueError, TypeError, RecursionError):
+                            continue
+                        with self._guard:
+                            self._snapshots[key] = snapshot
+                            self._unverified.add(key)
+                        restored += 1
+                        restored_entries += len(entries)
+                finally:
+                    connection.close()
+        except (OSError, sqlite3.Error, ValueError):
+            self._storage_error()
+        return restored
+
+    @staticmethod
+    def _timestamp(value: object) -> float | None:
+        if value is None:
+            return None
+        if type(value) not in {int, float} or not (-1e15 < value < 1e15):
+            raise ValueError("無效修改時間")
+        return float(value)
+
+    def flush(self) -> None:
+        """背景保存有變動的快取；不在 UI 執行 SQL 或序列化。"""
+        if self.file is None or self.error:
+            return
+        with self._database_lock:
+            with self._guard:
+                pending, self._pending = self._pending, {}
+                reset, self._reset_pending = self._reset_pending, False
+            if not pending and not reset:
+                return
+            try:
+                connection = self._connect()
+                try:
+                    with connection:
+                        if reset:
+                            connection.execute("DELETE FROM finder_directories")
+                        for key, snapshot in pending.items():
+                            if snapshot is None:
+                                connection.execute("DELETE FROM finder_directories WHERE key = ?", (key,))
+                            else:
+                                records = [None if item is None else [str(item.path), item.is_dir, item.modified_at] for item in snapshot.entries]
+                                payload = json.dumps([str(snapshot.root.path), snapshot.root.modified_at, snapshot.signature, records], ensure_ascii=True, separators=(",", ":"))
+                                if len(payload) <= MAX_CACHE_RECORD_BYTES:
+                                    connection.execute("INSERT OR REPLACE INTO finder_directories VALUES (?, ?)", (key, payload))
+                                else:
+                                    connection.execute("DELETE FROM finder_directories WHERE key = ?", (key,))
+                finally:
+                    connection.close()
+            except (OSError, sqlite3.Error, ValueError):
+                self._storage_error()
+
+    def check_changes(self, cancel: Event, directory: Path | None = None, *, refresh_times: bool = False) -> IndexCheck:
+        """核對每個已索引目錄的時間／身分；只有變動目錄才重新枚舉。"""
+        with self._guard:
+            snapshots = list(self._snapshots.items()) if directory is None else [(path_key(directory), self._snapshots.get(path_key(directory)))]
+        checked = changed = 0
+        errors = []
+        for key, snapshot in snapshots:
+            if cancel.is_set():
+                break
+            if snapshot is None:
+                continue
+            checked += 1
+            try:
+                metadata = plain_metadata(snapshot.root.path)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise NotADirectoryError(str(snapshot.root.path))
+                if directory_signature(metadata) != snapshot.signature:
+                    with self._guard:
+                        if self._snapshots.get(key) is snapshot:
+                            self._discard(key)
+                            changed += 1
+                    continue
+                entries = snapshot.entries
+                if refresh_times:
+                    updated = []
+                    for item in entries:
+                        if cancel.is_set():
+                            break
+                        if item is None:
+                            updated.append(None)
+                        else:
+                            info = plain_metadata(item.path)
+                            updated.append(replace(item, is_dir=stat.S_ISDIR(info.st_mode), modified_at=info.st_mtime))
+                    if cancel.is_set():
+                        break
+                    entries = tuple(updated)
+                updated_snapshot = DirectorySnapshot(replace(snapshot.root, modified_at=metadata.st_mtime), entries, snapshot.signature)
+                with self._guard:
+                    if self._snapshots.get(key) is snapshot:
+                        self._unverified.discard(key)
+                        if updated_snapshot != snapshot:
+                            self._snapshots[key] = updated_snapshot
+                            self._pending[key] = updated_snapshot
+            except OSError as error:
+                errors.append(path_error(snapshot.root.path, error))
+                with self._guard:
+                    if self._snapshots.get(key) is snapshot:
+                        self._discard(key)
+                        changed += 1
+        return IndexCheck(checked, changed, tuple(errors), cancel.is_set())
+
+    def _discard(self, key: str) -> None:
+        self._versions[key] = self._versions.get(key, 0) + 1
+        self._snapshots.pop(key, None)
+        self._unverified.discard(key)
+        self._pending[key] = None
 
     def directory_item(self, directory: Path) -> Item | None:
         with self._guard:
@@ -273,12 +480,14 @@ class DirectoryIndex:
         with self._guard:
             if directory is None:
                 self._generation += 1
+                self._pending.clear()
+                self._reset_pending = True
                 self._snapshots.clear()
                 self._versions.clear()
+                self._unverified.clear()
             else:
                 key = path_key(directory)
-                self._versions[key] = self._versions.get(key, 0) + 1
-                self._snapshots.pop(key, None)
+                self._discard(key)
 
     @contextmanager
     def listing(self, directory: Path, cancel: Event) -> Iterator[DirectoryListing]:
@@ -324,9 +533,14 @@ class DirectoryIndex:
 
                 yield DirectoryListing(root, read_entries())
             if complete and not failed and not cancel.is_set():
+                # 掃描途中變動的資料夾不保存為完整索引。
+                after = plain_metadata(directory)
+                snapshot = DirectorySnapshot(root, tuple(records), directory_signature(metadata))
                 with self._guard:
-                    if version == (self._generation, self._versions.get(key, 0)):
-                        self._snapshots[key] = DirectorySnapshot(root, tuple(records))
+                    if version == (self._generation, self._versions.get(key, 0)) and directory_signature(after) == snapshot.signature:
+                        self._snapshots[key] = snapshot
+                        self._unverified.discard(key)
+                        self._pending[key] = snapshot
         finally:
             lock.release()
 
@@ -566,3 +780,17 @@ def open_file(path: Path, opener: Callable[[str], None] | None) -> str:
         return path_error(path, error)
     except ValueError:
         return f"{display_text(path)}：路徑格式錯誤"
+
+
+def open_containing_folder(path: Path, opener: Callable[[str], None] | None) -> str:
+    """只要求 Windows 開啟父資料夾，不執行選取的檔案。"""
+    error = validate_folder(path.parent)
+    if error:
+        return error
+    if opener is None:
+        return "此工具的檔案開啟功能僅支援 Windows。"
+    try:
+        opener(str(path.parent))
+        return f"已要求 Windows 開啟所在資料夾：{display_text(path.parent)}"
+    except OSError as error:
+        return path_error(path.parent, error)
