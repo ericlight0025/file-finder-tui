@@ -8,12 +8,13 @@ import ntpath
 import os
 import stat
 import tempfile
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from time import monotonic
-from typing import Callable
+from typing import Callable, Iterator
 
 
 RESULT_LIMIT = 200
@@ -109,6 +110,8 @@ class ScanReport:
     cancelled: bool = False
     limited: bool = False
     skipped_links: int = 0
+    cached_directories: int = 0
+    read_directories: int = 0
 
     @property
     def complete(self) -> bool:
@@ -127,6 +130,8 @@ class ScanReport:
                 reasons.append(f"{len(self.errors)} 項讀取錯誤")
             result = f"結果不完整（{'、'.join(reasons)}）；已找到至少 {self.total} 筆，顯示 {len(self.items)} 筆"
         result += f"；已掃描 {self.scanned} 個項目"
+        if self.cached_directories or self.read_directories:
+            result += f"；重用 {self.cached_directories} 個資料夾快取，新讀取 {self.read_directories} 個資料夾"
         if self.skipped_links:
             result += f"；已排除 {self.skipped_links} 個連結／reparse point"
         if self.errors:
@@ -156,8 +161,11 @@ def entry_item(entry: os.DirEntry) -> Item | None:
     return Item(Path(entry.path), stat.S_ISDIR(metadata.st_mode), modified_at=metadata.st_mtime)
 
 
-def path_item(path: Path, label: str = "", require_dir: bool = False) -> Item:
+def path_item(path: Path, label: str = "", require_dir: bool = False, index: DirectoryIndex | None = None) -> Item:
     """取得首頁／收藏項目的類型與時間；失效路徑仍保留供移除。"""
+    saved = index.directory_item(path) if index is not None else None
+    if saved is not None:
+        return replace(saved, label=label)
     try:
         metadata = path.stat()
         is_dir = stat.S_ISDIR(metadata.st_mode)
@@ -178,14 +186,109 @@ class SearchProgress:
     directory: Path | None = None
     errors: int = 0
     skipped_links: int = 0
+    cached_directories: int = 0
+    read_directories: int = 0
 
 
-def scan_names(config: Config, query: str, cancel: Event | None = None, progress: Callable[[SearchProgress], None] | None = None) -> ScanReport:
+@dataclass(frozen=True)
+class DirectorySnapshot:
+    """保存一次完整枚舉的所有名稱與修改時間，不受 200 筆結果上限影響。"""
+    root: Item
+    entries: tuple[Item | str | None, ...]
+
+
+@dataclass(frozen=True)
+class DirectoryListing:
+    root: Item | None
+    entries: Iterator[Item | str | None]
+    cached: bool = False
+
+
+class DirectoryIndex:
+    """本次執行共用的記憶體索引；每個完整資料夾只枚舉一次，F5 才失效。"""
+    def __init__(self):
+        self._snapshots: dict[str, DirectorySnapshot] = {}
+        self._locks: dict[str, Lock] = {}
+        self._guard = Lock()
+        self._generation = 0
+        self._versions: dict[str, int] = {}
+
+    def directory_item(self, directory: Path) -> Item | None:
+        with self._guard:
+            snapshot = self._snapshots.get(path_key(directory))
+            return snapshot.root if snapshot is not None else None
+
+    def invalidate(self, directory: Path | None = None) -> None:
+        """更新當前資料夾或整份索引；舊工作不得在更新後重新寫回快取。"""
+        with self._guard:
+            if directory is None:
+                self._generation += 1
+                self._snapshots.clear()
+                self._versions.clear()
+            else:
+                key = path_key(directory)
+                self._versions[key] = self._versions.get(key, 0) + 1
+                self._snapshots.pop(key, None)
+
+    @contextmanager
+    def listing(self, directory: Path, cancel: Event) -> Iterator[DirectoryListing]:
+        """逐筆提供名稱，只有枚舉到底且沒有錯誤才保存，取消不保存半份資料。"""
+        key = path_key(directory)
+        with self._guard:
+            lock = self._locks.setdefault(key, Lock())
+        while not cancel.is_set():
+            if lock.acquire(timeout=0.05):
+                break
+        else:
+            yield DirectoryListing(None, iter(()))
+            return
+        try:
+            if cancel.is_set():
+                yield DirectoryListing(None, iter(()))
+                return
+            with self._guard:
+                version = (self._generation, self._versions.get(key, 0))
+                snapshot = self._snapshots.get(key)
+            if snapshot is not None:
+                yield DirectoryListing(snapshot.root, iter(snapshot.entries), True)
+                return
+            records: list[Item | str | None] = []
+            complete = failed = False
+            with os.scandir(directory) as entries:
+                metadata = directory.stat()
+                root = Item(directory, True, modified_at=metadata.st_mtime)
+
+                def read_entries() -> Iterator[Item | str | None]:
+                    nonlocal complete, failed
+                    for entry in entries:
+                        if cancel.is_set():
+                            return
+                        try:
+                            record = entry_item(entry)
+                        except OSError as error:
+                            record = path_error(entry.path, error)
+                            failed = True
+                        records.append(record)
+                        yield record
+                    complete = True
+
+                yield DirectoryListing(root, read_entries())
+            if complete and not failed and not cancel.is_set():
+                with self._guard:
+                    if version == (self._generation, self._versions.get(key, 0)):
+                        self._snapshots[key] = DirectorySnapshot(root, tuple(records))
+        finally:
+            lock.release()
+
+
+def scan_names(config: Config, query: str, cancel: Event | None = None, progress: Callable[[SearchProgress], None] | None = None, index: DirectoryIndex | None = None) -> ScanReport:
     cancel = cancel or Event()
+    index = index if index is not None else DirectoryIndex()
     best: list[tuple[tuple, Item]] = []
     errors: list[str] = []
     visited: set[str] = set()
     total = scanned = skipped_links = 0
+    cached_directories = read_directories = 0
     limited = False
     directory = None
     last_progress = float("-inf")
@@ -199,10 +302,10 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
         if progress is None or cancel.is_set():
             return
         now = monotonic()
-        # 限制背景訊息頻率；最後一份快照保留實際計數，不建立索引。
+        # 限制背景訊息頻率；分別回報快取重用與真正的磁碟讀取。
         if force or now - last_progress >= PROGRESS_INTERVAL_SECONDS:
             last_progress = now
-            progress(SearchProgress(scanned, total, directory, len(errors), skipped_links))
+            progress(SearchProgress(scanned, total, directory, len(errors), skipped_links, cached_directories, read_directories))
 
     def consider(item: Item) -> None:
         nonlocal total
@@ -223,11 +326,16 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
         visited.add(key)
         publish_progress()
         try:
-            with os.scandir(directory) as entries:
+            with index.listing(directory, cancel) as listing:
+                if listing.root is None:
+                    continue
+                if listing.cached:
+                    cached_directories += 1
+                else:
+                    read_directories += 1
                 if is_root:
-                    metadata = directory.stat()
-                    consider(Item(directory, True, modified_at=metadata.st_mtime))
-                for entry in entries:
+                    consider(listing.root)
+                for item in listing.entries:
                     if cancel.is_set():
                         break
                     publish_progress()
@@ -235,10 +343,8 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
                         limited = True
                         break
                     scanned += 1
-                    try:
-                        item = entry_item(entry)
-                    except OSError as error:
-                        errors.append(path_error(entry.path, error))
+                    if isinstance(item, str):
+                        errors.append(item)
                         continue
                     if item is None:
                         skipped_links += 1
@@ -254,32 +360,36 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
         except OSError as error:
             errors.append(path_error(directory, error))
     publish_progress(force=True)
-    return ScanReport(tuple(item for _, item in best), total, scanned, tuple(errors), cancel.is_set(), limited, skipped_links)
+    return ScanReport(tuple(item for _, item in best), total, scanned, tuple(errors), cancel.is_set(), limited, skipped_links, cached_directories, read_directories)
 
 
-def browse_folder(directory: Path, cancel: Event | None = None) -> ScanReport:
+def browse_folder(directory: Path, cancel: Event | None = None, index: DirectoryIndex | None = None) -> ScanReport:
     """只讀取直接子項目；此處不套用搜尋的 200 筆顯示上限。"""
     cancel = cancel or Event()
+    track_cache = index is not None
+    index = index if index is not None else DirectoryIndex()
     items, errors = [], []
     scanned = skipped_links = 0
+    cached_directories = read_directories = 0
     try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
+        with index.listing(directory, cancel) as listing:
+            if listing.root is not None and track_cache:
+                cached_directories = int(listing.cached)
+                read_directories = int(not listing.cached)
+            for item in listing.entries:
                 if cancel.is_set():
                     break
                 scanned += 1
-                try:
-                    item = entry_item(entry)
-                    if item is None:
-                        skipped_links += 1
-                    else:
-                        items.append(item)
-                except OSError as error:
-                    errors.append(path_error(entry.path, error))
+                if isinstance(item, str):
+                    errors.append(item)
+                elif item is None:
+                    skipped_links += 1
+                else:
+                    items.append(item)
     except OSError as error:
         errors.append(path_error(directory, error))
     items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
-    return ScanReport(tuple(items), len(items), scanned, tuple(errors), cancel.is_set(), False, skipped_links)
+    return ScanReport(tuple(items), len(items), scanned, tuple(errors), cancel.is_set(), False, skipped_links, cached_directories, read_directories)
 
 
 def validate_folder(path: Path) -> str:
@@ -344,32 +454,32 @@ class Favorites:
         return not exists
 
 
-def list_favorites(favorites: Favorites, cancel: Event) -> tuple[Item, ...]:
+def list_favorites(favorites: Favorites, cancel: Event, index: DirectoryIndex | None = None) -> tuple[Item, ...]:
     """只讀取已收藏路徑，不展開其中的資料夾；資料夾排序在前。"""
     items: list[Item] = []
     for path in tuple(favorites.paths):
         if cancel.is_set():
             break
-        items.append(path_item(path))
+        items.append(path_item(path, index=index))
     items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
     return tuple(items)
 
 
-def list_home_items(config: Config, favorites: Favorites, cancel: Event, menu: str = "folders") -> tuple[Item, ...]:
+def list_home_items(config: Config, favorites: Favorites, cancel: Event, menu: str = "folders", index: DirectoryIndex | None = None) -> tuple[Item, ...]:
     """讀取指定分頁的首頁項目，前端不直接存取檔案系統。"""
     if menu == "favorites":
-        return list_favorites(favorites, cancel)
+        return list_favorites(favorites, cancel, index)
     items: list[Item] = []
     for root in config.roots:
         if cancel.is_set():
             break
-        items.append(path_item(root.path, root.name, require_dir=True))
+        items.append(path_item(root.path, root.name, require_dir=True, index=index))
     return tuple(items)
 
 
-def search_favorites(favorites: Favorites, query: str, cancel: Event) -> ScanReport:
+def search_favorites(favorites: Favorites, query: str, cancel: Event, index: DirectoryIndex | None = None) -> ScanReport:
     """依完整關鍵字篩選收藏名稱，保留取消與讀取錯誤資訊。"""
-    items = list_favorites(favorites, cancel)
+    items = list_favorites(favorites, cancel, index)
     matches = sorted((item for item in items if match_rank(query, item.name) is not None), key=lambda item: search_key(query, item))
     return ScanReport(tuple(matches[:RESULT_LIMIT]), len(matches), len(items), tuple(item.error for item in items if item.error), cancel.is_set())
 
@@ -385,4 +495,3 @@ def open_file(path: Path, opener: Callable[[str], None] | None) -> str:
         return f"已要求 Windows 開啟：{path}"
     except OSError as error:
         return path_error(path, error)
-

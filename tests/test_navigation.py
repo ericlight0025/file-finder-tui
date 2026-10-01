@@ -153,7 +153,7 @@ def test_tui_debounce_responsiveness_and_stale_result_guard(project, monkeypatch
     started, release, old_cancelled = Event(), Event(), Event()
     calls = []
 
-    def slow_scan(config, query, cancel, progress=None):
+    def slow_scan(config, query, cancel, progress=None, index=None):
         calls.append(query)
         if query == "old":
             started.set()
@@ -206,7 +206,7 @@ def test_live_progress_elapsed_time_stale_messages_and_final_status(project, mon
     release_old, release_new = Event(), Event()
     callbacks = {}
 
-    def controlled_scan(config, query, cancel, progress):
+    def controlled_scan(config, query, cancel, progress, index=None):
         callbacks[query] = progress
         if query == "old":
             progress(SearchProgress(3, 2, config.roots[0].path, 1))
@@ -271,7 +271,7 @@ def test_escape_during_progress_keeps_homepage(project, monkeypatch):
     _, file = project
     started, release = Event(), Event()
 
-    def controlled_scan(config, query, cancel, progress):
+    def controlled_scan(config, query, cancel, progress, index=None):
         progress(SearchProgress(3, 2, config.roots[0].path))
         started.set()
         release.wait(5)
@@ -318,9 +318,9 @@ def test_tui_favorites_focus_persistence_and_return_home(project):
             results = app.query_one(OptionList)
             for item, option in zip(app.navigation.view.items, results.options):
                 if item is not None and item.label == config.roots[0].name:
-                    assert str(config.roots[0].path) == str(option.prompt).splitlines()[-1].strip()
+                    assert str(config.roots[0].path) == str(option.prompt).rstrip().splitlines()[-1].strip()
                 elif item is not None and item.path == deep:
-                    assert str(deep.parent) == str(option.prompt).splitlines()[-1].strip()
+                    assert str(deep.parent) == str(option.prompt).rstrip().splitlines()[-1].strip()
             results.focus()
             results.highlighted = 0
             await pilot.press("enter")
@@ -505,7 +505,7 @@ def test_startup_input_and_escape_do_not_cancel_initialization(project, monkeypa
     asyncio.run(scenario())
 
 
-def test_tui_returns_to_folder_by_reading_current_children(project):
+def test_tui_returns_to_cached_folder_and_f5_updates_children(project):
     config, file = project
     root = config.roots[0].path
     child = root / "child"
@@ -523,8 +523,12 @@ def test_tui_returns_to_folder_by_reading_current_children(project):
             await wait_until(lambda: app.navigation.view.directory == child and app.navigation.view.report is not None)
             (root / "new.txt").touch()
             await pilot.press("backspace")
+            await wait_until(lambda: app.navigation.view.directory == root and app.navigation.view.report is not None)
+            assert not any(item.name == "new.txt" for item in app.navigation.view.items)
+            assert app.navigation.view.report.cached_directories == 1
+            await pilot.press("f5")
             await wait_until(lambda: any(item.name == "new.txt" for item in app.navigation.view.items))
-            assert app.navigation.view.directory == root
+            assert app.navigation.view.report.read_directories == 1
 
     asyncio.run(scenario())
 
@@ -624,12 +628,12 @@ def test_tabs_keep_separate_search_history_and_ignore_old_results(project, monke
     Favorites(file.with_name("favorites.json")).toggle(folder)
     original = backend.scan_names
 
-    def controlled_scan(config, query, cancel, progress=None):
+    def controlled_scan(config, query, cancel, progress=None, index=None):
         if query == "old":
             started.set()
             release.wait(5)
             return ScanReport((Item(config.roots[0].path / "OLD.txt", False),), 1)
-        return original(config, query, cancel, progress)
+        return original(config, query, cancel, progress, index)
 
     monkeypatch.setattr(backend, "scan_names", controlled_scan)
 
@@ -826,5 +830,31 @@ def test_escape_restores_search_and_intervening_key_cancels_double_escape(projec
             clock[0] += 1.0
             await pilot.press("escape")
             await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
+
+    asyncio.run(scenario())
+
+
+def test_folder_path_only_in_header_and_search_paths_still_distinguish_names(project):
+    """資料夾內省略重複路徑；跨目錄搜尋仍可區分相同檔名。"""
+    config, file = project
+    for root in config.roots[:2]:
+        (root.path / "report.xlsx").touch()
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            await pilot.press("down", "enter")
+            await wait_until(lambda: app.navigation.view.kind == "browse" and app.navigation.view.report is not None)
+            root = config.roots[0].path
+            assert str(root) in str(app.query_one("#location", Static).render())
+            prompt = str(app.query_one(OptionList).get_option_at_index(0).prompt)
+            assert "report.xlsx" in prompt and "更新：" in prompt
+            assert str(root) not in prompt
+            app.query_one(Input).value = "report"
+            await wait_until(lambda: app.navigation.view.kind == "search" and app.navigation.view.report is not None)
+            assert len(app.navigation.view.items) == 2
+            for item, option in zip(app.navigation.view.items, app.query_one(OptionList).options):
+                assert str(item.path.parent) in str(option.prompt)
 
     asyncio.run(scenario())
