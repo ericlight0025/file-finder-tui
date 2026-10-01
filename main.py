@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime
 from threading import Event
 from time import monotonic
 from typing import Callable
@@ -23,7 +24,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Input, OptionList, Static
+from textual.widgets import Button, Input, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
 
@@ -134,10 +135,21 @@ class Item:
     is_dir: bool
     label: str = ""
     error: str = ""
+    modified_at: float | None = None
 
     @property
     def name(self) -> str:
         return self.path.name or str(self.path)
+
+    @property
+    def modified_text(self) -> str:
+        """依執行電腦的本地時區顯示檔案系統修改時間。"""
+        if self.modified_at is None:
+            return "無法取得"
+        try:
+            return datetime.fromtimestamp(self.modified_at).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return "無法取得"
 
 
 @dataclass(frozen=True)
@@ -175,19 +187,17 @@ class ScanReport:
 
 
 def match_rank(query: str, name: str) -> int | None:
-    """連續子字串優先，其次為依序字元；不讀取檔案內容。"""
-    query, name = query.casefold(), name.casefold()
-    if query in name:
-        return 0
-    position = 0
-    for character in name:
-        if position < len(query) and character == query[position]:
-            position += 1
-    return 1 if position == len(query) else None
+    """空白分隔的每個關鍵字都須完整出現在名稱中，忽略大小寫。"""
+    query, name = query.strip().casefold(), name.casefold()
+    words = query.split()
+    if not words or not all(word in name for word in words):
+        return None
+    # 全段連續命中優先，但多個關鍵字不要求排列順序。
+    return 0 if query in name else 1
 
 
 def search_key(query: str, item: Item) -> tuple:
-    return (match_rank(query, item.name), not item.is_dir, len(item.name), item.name.casefold(), path_key(item.path))
+    return (not item.is_dir, match_rank(query, item.name), len(item.name), item.name.casefold(), path_key(item.path))
 
 
 def entry_item(entry: os.DirEntry) -> Item | None:
@@ -195,7 +205,22 @@ def entry_item(entry: os.DirEntry) -> Item | None:
     metadata = entry.stat(follow_symlinks=False)
     if entry.is_symlink() or getattr(metadata, "st_file_attributes", 0) & REPARSE_POINT:
         return None
-    return Item(Path(entry.path), stat.S_ISDIR(metadata.st_mode))
+    return Item(Path(entry.path), stat.S_ISDIR(metadata.st_mode), modified_at=metadata.st_mtime)
+
+
+def path_item(path: Path, label: str = "", require_dir: bool = False) -> Item:
+    """取得首頁／收藏項目的類型與時間；失效路徑仍保留供移除。"""
+    try:
+        metadata = path.stat()
+        is_dir = stat.S_ISDIR(metadata.st_mode)
+        if require_dir and not is_dir:
+            return Item(path, False, label, f"{path}：不是資料夾", metadata.st_mtime)
+        if not is_dir and not stat.S_ISREG(metadata.st_mode):
+            return Item(path, False, label, f"{path}：不是一般檔案或資料夾", metadata.st_mtime)
+        error = validate_folder(path) if is_dir else ""
+        return Item(path, is_dir, label, error, metadata.st_mtime)
+    except OSError as error:
+        return Item(path, require_dir, label, path_error(path, error))
 
 
 @dataclass(frozen=True)
@@ -216,7 +241,7 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
     limited = False
     directory = None
     last_progress = float("-inf")
-    if not query:
+    if not query.strip():
         return ScanReport()
     # 根目錄本身也屬於名稱搜尋範圍；重疊根目錄只計算一次。
     stack = [(root.path, True) for root in reversed(config.roots)]
@@ -252,7 +277,8 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
         try:
             with os.scandir(directory) as entries:
                 if is_root:
-                    consider(Item(directory, True))
+                    metadata = directory.stat()
+                    consider(Item(directory, True, modified_at=metadata.st_mtime))
                 for entry in entries:
                     if cancel.is_set():
                         break
@@ -344,9 +370,9 @@ class Favorites:
             raise ValueError(self.error)
         exists = self.contains(path)
         if not exists:
-            error = validate_folder(path)
-            if error:
-                raise ValueError(f"只能收藏可讀取的資料夾。{error}")
+            item = path_item(path)
+            if item.error:
+                raise ValueError(f"只能收藏可讀取的一般檔案或資料夾。{item.error}")
         updated = [saved for saved in self.paths if path_key(saved) != path_key(path)] if exists else [*self.paths, path]
         temporary = None
         try:
@@ -512,6 +538,7 @@ class FileFinderApp(App):
     CSS = """
     Screen { layout: vertical; background: $background; color: $foreground; }
     #title { height: 1; margin: 1 2 0 2; color: $primary; text-style: bold; }
+    #menu { margin: 1 2 0 2; }
     #search { margin: 1 2; border: round $border-blurred; background: $surface; }
     #search:focus { border: round $primary; background-tint: transparent; }
     #search > .input--placeholder { color: $text-muted; }
@@ -531,7 +558,10 @@ class FileFinderApp(App):
         Binding("alt+left", "history_back", "上一頁", priority=True),
         Binding("alt+right", "forward", "下一頁", priority=True),
         Binding("ctrl+e", "errors", "錯誤詳情", priority=True),
-        Binding("f,F", "favorite", "最愛", show=False),
+        Binding("ctrl+f", "favorite", "最愛", priority=True),
+        Binding("alt+1", "menu('folders')", "資料夾", priority=True),
+        Binding("alt+2", "menu('favorites')", "我的最愛", priority=True),
+        Binding("ctrl+tab", "next_menu", "切換分頁", priority=True),
         Binding("backspace", "back", "返回", show=False),
     ]
 
@@ -544,7 +574,11 @@ class FileFinderApp(App):
         self.configuration_error = ""
         self.config: Config | None = None
         self.favorites: Favorites | None = None
-        self.navigation = Navigation()
+        # 分頁各自保留搜尋文字、選取位置及瀏覽歷史。
+        self.active_menu = "folders"
+        self.navigations = {"folders": Navigation(), "favorites": Navigation()}
+        self.navigation = self.navigations[self.active_menu]
+        self.menu_inputs = {"folders": "", "favorites": ""}
         self.gate = RequestGate()
         self.debounce_timer = None
         self.favorite_busy = False
@@ -552,11 +586,12 @@ class FileFinderApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static("File Finder", id="title")
-        yield Input(placeholder="搜尋檔案或資料夾…", id="search", select_on_focus=False)
+        yield Tabs(Tab("資料夾", id="folders"), Tab("★ 我的最愛", id="favorites"), active="folders", id="menu", disabled=True)
+        yield Input(placeholder="搜尋名稱；空白分隔的關鍵字須全部符合…", id="search", select_on_focus=False)
         yield Static(f"首頁\n設定檔：{self.config_path}", id="location", markup=False)
         yield OptionList(id="results", markup=False)
         yield Static("正在驗證設定與根目錄…", id="status", markup=False)
-        yield Static("↑↓ 選取 | Enter 開啟 | F 最愛 | Backspace／Alt+← 返回 | Alt+→ 前進 | Esc 首頁\nCtrl+L 搜尋 | Ctrl+E 錯誤詳情 | Ctrl+Q 結束 | 滑鼠單擊選取並開啟", id="keys", markup=False)
+        yield Static("直接打字搜尋 | ↑↓ 選取 | Enter 開啟 | Ctrl+F 收藏／移除 | Backspace／Alt+← 返回 | Alt+→ 前進\nAlt+1 資料夾 | Alt+2 我的最愛 | Ctrl+Tab 切分頁 | Esc 首頁 | Ctrl+L 搜尋 | Ctrl+E 錯誤 | Ctrl+Q 結束", id="keys", markup=False)
 
     def on_mount(self) -> None:
         self.set_interval(PROGRESS_INTERVAL_SECONDS, self.refresh_search_progress)
@@ -575,17 +610,19 @@ class FileFinderApp(App):
         self.post_message(IOResult(generation, "initialize", payload))
 
     @staticmethod
-    def home_items(config: Config, favorites: Favorites, cancel: Event) -> tuple[Item | None, ...]:
-        items: list[Item | None] = [None]
-        for path in favorites.paths:
-            if cancel.is_set():
-                break
-            items.append(Item(path, True, str(path), validate_folder(path)))
-        items.append(None)
-        for root in config.roots:
-            if cancel.is_set():
-                break
-            items.append(Item(root.path, True, root.name, validate_folder(root.path)))
+    def home_items(config: Config, favorites: Favorites, cancel: Event, menu: str = "folders") -> tuple[Item, ...]:
+        items: list[Item] = []
+        if menu == "favorites":
+            for path in tuple(favorites.paths):
+                if cancel.is_set():
+                    break
+                items.append(path_item(path))
+            items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
+        else:
+            for root in config.roots:
+                if cancel.is_set():
+                    break
+                items.append(path_item(root.path, root.name, require_dir=True))
         return tuple(items)
 
     def invalidate(self) -> tuple[int, Event]:
@@ -603,6 +640,7 @@ class FileFinderApp(App):
             search.cursor_position = len(value)
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        self.menu_inputs[self.active_menu] = event.value
         self.search_changed(event.value)
 
     def search_changed(self, value: str) -> None:
@@ -617,7 +655,7 @@ class FileFinderApp(App):
         else:
             self.navigation.home()
             self.render_view()
-            self.load_home(generation, cancel)
+            self.load_home(generation, cancel, self.active_menu)
 
     def start_search(self, generation: int, query: str, cancel: Event) -> None:
         self.debounce_timer = None
@@ -625,7 +663,7 @@ class FileFinderApp(App):
             self.navigation.view.search_started = monotonic()
             self.navigation.view.progress = SearchProgress()
             self.refresh_search_progress()
-            self.search_worker(generation, query, cancel)
+            self.search_worker(generation, query, cancel, self.active_menu)
 
     def refresh_search_progress(self) -> None:
         view = self.navigation.view
@@ -641,15 +679,21 @@ class FileFinderApp(App):
         self.set_status(status)
 
     @work(thread=True, exclusive=True, group="io")
-    def search_worker(self, generation: int, query: str, cancel: Event) -> None:
+    def search_worker(self, generation: int, query: str, cancel: Event, menu: str) -> None:
         def progress(snapshot: SearchProgress) -> None:
             self.post_message(IOResult(generation, "progress", snapshot))
 
-        self.post_message(IOResult(generation, "search", scan_names(self.config, query, cancel, progress)))
+        if menu == "favorites":
+            items = self.home_items(self.config, self.favorites, cancel, menu)
+            matches = sorted((item for item in items if match_rank(query, item.name) is not None), key=lambda item: search_key(query, item))
+            report = ScanReport(tuple(matches[:RESULT_LIMIT]), len(matches), len(items), tuple(item.error for item in items if item.error), cancel.is_set())
+        else:
+            report = scan_names(self.config, query, cancel, progress)
+        self.post_message(IOResult(generation, "search", report))
 
     @work(thread=True, exclusive=True, group="io")
-    def load_home(self, generation: int, cancel: Event) -> None:
-        self.post_message(IOResult(generation, "home", self.home_items(self.config, self.favorites, cancel)))
+    def load_home(self, generation: int, cancel: Event, menu: str) -> None:
+        self.post_message(IOResult(generation, "home", self.home_items(self.config, self.favorites, cancel, menu)))
 
     @work(thread=True, exclusive=True, group="io")
     def load_folder(self, generation: int, directory: Path, cancel: Event) -> None:
@@ -672,6 +716,7 @@ class FileFinderApp(App):
             view.items = items
             view.status = error or self.home_status(items)
             self.query_one(Input).disabled = self.config is None
+            self.query_one(Tabs).disabled = self.config is None
         elif message.kind == "home":
             view.items = message.payload
             view.status = self.home_status(view.items)
@@ -693,7 +738,8 @@ class FileFinderApp(App):
             warnings.append(f"{len(invalid)} 個根目錄／最愛無法讀取；{invalid[0]}")
         if warnings:
             warnings.append("Ctrl+E 查看全部錯誤")
-        return "準備搜尋" + ("\n" + "\n".join(warnings) if warnings else "")
+        ready = "尚無最愛；選取檔案或資料夾後按 Ctrl+F 收藏" if self.active_menu == "favorites" and not items else "準備搜尋"
+        return ready + ("\n" + "\n".join(warnings) if warnings else "")
 
     @staticmethod
     def browse_status(report: ScanReport) -> str:
@@ -713,20 +759,17 @@ class FileFinderApp(App):
     def render_view(self) -> None:
         view = self.navigation.view
         options = []
-        section = 0
         for item in view.items:
             if item is None:
-                section += 1
-                title = "★ 我的最愛" if section == 1 else "📂 搜尋根目錄"
-                options.append(Option(title, disabled=True))
+                options.append(Option("", disabled=True))
                 continue
             star = " ★" if self.favorites and self.favorites.contains(item.path) else ""
             invalid = " [失效／無法讀取]" if item.error else ""
             icon = "📁" if item.is_dir else "📄"
             label = item.label or item.name
             # 首頁根目錄顯示完整搜尋路徑；檔案與子項目顯示父目錄以區分同名項目。
-            location = item.path if view.kind == "home" and section == 2 else item.path.parent
-            prompt = f"{icon} {label}{star}{invalid}\n  {location}"
+            location = item.path if view.kind == "home" and self.active_menu == "folders" else item.path.parent
+            prompt = f"{icon} {label}{star}{invalid}\n  更新：{item.modified_text}\n  {location}"
             options.append(Option(prompt))
         results = self.query_one(OptionList)
         previous = view.selected
@@ -736,7 +779,8 @@ class FileFinderApp(App):
         elif options:
             results.action_first()
         view.selected = results.highlighted
-        location = str(view.directory) if view.kind == "browse" else (f"搜尋：{view.query}（固定三個根目錄）" if view.kind == "search" else f"首頁\n設定檔：{self.config_path}")
+        scope = "我的最愛名稱" if self.active_menu == "favorites" else "固定三個根目錄"
+        location = str(view.directory) if view.kind == "browse" else (f"搜尋：{view.query}（{scope}；關鍵字全部符合）" if view.kind == "search" else f"{'我的最愛' if self.active_menu == 'favorites' else '搜尋根目錄'}\n設定檔：{self.config_path}")
         self.query_one("#location", Static).update(location)
         self.set_status(view.status)
 
@@ -745,6 +789,8 @@ class FileFinderApp(App):
         self.navigation.view.selected = event.option_index
 
     def on_key(self, event: events.Key) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
         if isinstance(self.focused, Input) and event.key in {"down", "up"}:
             results = self.query_one(OptionList)
             results.focus()
@@ -754,6 +800,46 @@ class FileFinderApp(App):
                 results.action_last()
             event.stop()
             event.prevent_default()
+        elif event.is_printable and "+" not in event.key and not isinstance(self.focused, Input):
+            # 清單或分頁取得焦點時，第一個字就送入同一個搜尋欄，不能遺失。
+            search = self.query_one(Input)
+            if not search.disabled:
+                search.focus()
+                search.insert_text_at_cursor(event.character)
+                event.stop()
+                event.prevent_default()
+
+    def on_paste(self, event: events.Paste) -> None:
+        if isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input):
+            return
+        search = self.query_one(Input)
+        if not search.disabled:
+            search.focus()
+            search.insert_text_at_cursor(" ".join(event.text.splitlines()))
+            event.stop()
+            event.prevent_default()
+
+    @on(Tabs.TabActivated, "#menu")
+    def on_menu_activated(self, event: Tabs.TabActivated) -> None:
+        self.action_menu(event.tab.id)
+
+    def action_menu(self, menu: str) -> None:
+        if isinstance(self.screen, ModalScreen) or self.config is None or menu == self.active_menu:
+            return
+        if menu not in self.navigations:
+            return
+        self.menu_inputs[self.active_menu] = self.query_one(Input).value
+        generation, cancel = self.invalidate()
+        self.active_menu = menu
+        self.navigation = self.navigations[menu]
+        with self.prevent(Tabs.TabActivated):
+            self.query_one(Tabs).active = menu
+        self.restore_navigation_view(generation, cancel)
+        self.set_input(self.menu_inputs[menu])
+        self.query_one(Input).focus()
+
+    def action_next_menu(self) -> None:
+        self.action_menu("favorites" if self.active_menu == "folders" else "folders")
 
     @on(OptionList.OptionSelected, "#results")
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -809,7 +895,7 @@ class FileFinderApp(App):
         self.set_input("")
         self.render_view()
         if self.config and self.favorites:
-            self.load_home(generation, cancel)
+            self.load_home(generation, cancel, self.active_menu)
         self.query_one(Input).focus()
 
     def action_back(self) -> None:
@@ -845,7 +931,7 @@ class FileFinderApp(App):
             # 返回資料夾也重新讀取，不依賴之前的資料夾快取。
             self.load_folder(generation, view.directory, cancel)
         elif view.kind == "home":
-            self.load_home(generation, cancel)
+            self.load_home(generation, cancel, self.active_menu)
         elif view.report is None:
             self.start_search(generation, view.query, cancel)
 
@@ -880,9 +966,6 @@ class FileFinderApp(App):
         item = self.navigation.view.items[index]
         if item is None:
             return
-        if not item.is_dir:
-            self.set_status("只能收藏資料夾，不能收藏單一檔案。")
-            return
         if self.favorite_busy:
             return
         self.favorite_busy = True
@@ -901,7 +984,10 @@ class FileFinderApp(App):
         self.favorite_busy = False
         if self.navigation.view.kind == "home":
             generation, cancel = self.invalidate()
-            self.load_home(generation, cancel)
+            self.load_home(generation, cancel, self.active_menu)
+        elif self.active_menu == "favorites" and self.navigation.view.kind == "search":
+            # 收藏搜尋中移除項目後重新篩選，不保留已取消的收藏結果。
+            self.search_changed(self.query_one(Input).value)
         else:
             self.render_view()
         self.set_status(message.status)

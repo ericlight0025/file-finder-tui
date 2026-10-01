@@ -16,12 +16,17 @@ from main import Config, Item, RequestGate, Root, entry_item, load_config, match
 
 
 @pytest.mark.parametrize("query,name,expected", [
-    ("rpt", "report.xlsx", 1), ("REPORT", "report.xlsx", 0),
+    ("rpt", "report.xlsx", None), ("REPORT", "report.xlsx", 0),
     ("報告", "月度報告.xlsx", 0), ("rpt", "rpt.xlsx", 0),
     ("rpt", "part.txt", None), ("aaa", "abca", None),
-    ("aaa", "aabca", 1), ("ss", "straße.txt", 0),
+    ("aaa", "aabca", None), ("ss", "straße.txt", 0),
+    ("契變 2026", "2026_契變報告.xlsx", 1),
+    ("契變 2026", "契變報告.xlsx", None),
+    ("REPORT\t2026", "2026_report.xlsx", 1),
+    ("  ", "report.xlsx", None),
+    ("報告", "報表_公告.xlsx", None),
 ])
-def test_fuzzy_match(query, name, expected):
+def test_all_keywords_must_match_complete_substrings(query, name, expected):
     assert match_rank(query, name) == expected
 
 
@@ -35,7 +40,7 @@ def test_recursive_same_names_and_no_content_reads(project, monkeypatch):
         file.write_text("檔案內容不得被搜尋讀取", encoding="utf-8")
         expected.add(file)
     monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: pytest.fail("名稱搜尋不得讀取內容"))
-    report = scan_names(config, "rpt")
+    report = scan_names(config, "report")
     assert report.complete
     assert report.total == 3
     assert {item.path for item in report.items} == expected
@@ -50,7 +55,36 @@ def test_sort_priority(project):
     for name in ("rpt.b", "rpt.a", "xrpt.txt", "report.xlsx"):
         (root / name).touch()
     report = scan_names(config, "rpt")
-    assert [item.name for item in report.items] == ["rpt", "rptLong", "rpt.a", "rpt.b", "xrpt.txt", "rapt", "report.xlsx"]
+    assert [item.name for item in report.items] == ["rpt", "rptLong", "rpt.a", "rpt.b", "xrpt.txt"]
+
+
+def test_folders_precede_files_with_better_text_rank(project):
+    config, _ = project
+    root = config.roots[0].path
+    folder = root / "2026_契變報告"
+    folder.mkdir()
+    (root / "契變 2026.xlsx").touch()
+    (root / "契變.xlsx").touch()
+    report = scan_names(config, "契變 2026")
+    assert report.total == 2
+    assert report.items[0].path == folder
+    assert report.items[1].name == "契變 2026.xlsx"
+
+
+def test_search_and_browse_capture_filesystem_modified_time(project):
+    config, _ = project
+    folder = config.roots[0].path / "report"
+    folder.mkdir()
+    file = folder / "report.xlsx"
+    file.touch()
+    os.utime(file, (1_700_000_000, 1_700_000_000))
+    os.utime(folder, (1_600_000_000, 1_600_000_000))
+    report = scan_names(config, "report")
+    by_path = {item.path: item for item in report.items}
+    assert by_path[file].modified_at == file.stat().st_mtime
+    assert by_path[folder].modified_at == folder.stat().st_mtime
+    assert main.browse_folder(folder).items[0].modified_at == file.stat().st_mtime
+    assert Item(file, False).modified_text == "無法取得"
 
 
 def test_total_and_best_200_across_entire_scan(project):
@@ -115,7 +149,7 @@ def test_progress_counts_and_errors_cover_three_roots(project):
         child.mkdir()
         (child / "report.txt").touch()
     config.roots[2].path.rmdir()
-    report = scan_names(config, "rpt", progress=snapshots.append)
+    report = scan_names(config, "report", progress=snapshots.append)
     assert snapshots[0].scanned == snapshots[0].found == 0
     assert snapshots[0].directory == config.roots[0].path
     assert snapshots[-1].scanned == report.scanned == 4
