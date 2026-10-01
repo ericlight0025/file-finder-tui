@@ -5,7 +5,8 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from textual.widgets import Input, OptionList, Static
+from textual import events
+from textual.widgets import Input, OptionList, Static, Tabs
 
 import main
 from main import Config, ConfirmOpen, ErrorDetails, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, SearchProgress, View, browse_folder
@@ -114,7 +115,7 @@ def test_tui_search_enter_back_escape_and_input_backspace(project):
         app = FileFinderApp(file, opener=lambda path: None)
         async with app.run_test(size=(110, 40)) as pilot:
             await wait_until(lambda: app.config is not None)
-            app.query_one(Input).value = "rpt"
+            app.query_one(Input).value = "report"
             await wait_until(lambda: app.navigation.view.report is not None)
             assert app.navigation.view.items[0].path == deep
             app.query_one(OptionList).focus()
@@ -124,7 +125,7 @@ def test_tui_search_enter_back_escape_and_input_backspace(project):
             assert app.navigation.view.items[0].name == "child.txt"
             await pilot.press("backspace")
             assert app.navigation.view.kind == "search"
-            assert app.query_one(Input).value == "rpt"
+            assert app.query_one(Input).value == "report"
             assert app.navigation.view.items[0].path == deep
             await pilot.press("ctrl+l")
             assert isinstance(app.focused, Input)
@@ -135,7 +136,7 @@ def test_tui_search_enter_back_escape_and_input_backspace(project):
             await wait_until(lambda: app.navigation.view.kind == "search")
             await pilot.press("ctrl+l", "backspace")
             await pilot.pause()
-            assert app.query_one(Input).value == "rp"
+            assert app.query_one(Input).value == "repor"
             await pilot.press("escape")
             await wait_until(lambda: app.navigation.view.kind == "home" and len(app.navigation.view.items) > 0)
             assert app.query_one(Input).value == ""
@@ -307,7 +308,10 @@ def test_tui_favorites_focus_persistence_and_return_home(project):
         app = FileFinderApp(file)
         async with app.run_test(size=(110, 40)) as pilot:
             await wait_until(lambda: app.config is not None)
-            assert app.navigation.view.items[1].path == deep
+            assert [item.path for item in app.navigation.view.items] == [root.path for root in config.roots]
+            await pilot.press("alt+2")
+            await wait_until(lambda: app.active_menu == "favorites" and bool(app.navigation.view.items))
+            assert app.navigation.view.items[0].path == deep
             results = app.query_one(OptionList)
             for item, option in zip(app.navigation.view.items, results.options):
                 if item is not None and item.label == config.roots[0].name:
@@ -315,14 +319,14 @@ def test_tui_favorites_focus_persistence_and_return_home(project):
                 elif item is not None and item.path == deep:
                     assert str(deep.parent) == str(option.prompt).splitlines()[-1].strip()
             results.focus()
-            results.highlighted = 1
+            results.highlighted = 0
             await pilot.press("enter")
             await wait_until(lambda: app.navigation.view.report is not None)
             await pilot.press("backspace")
             await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
-            assert app.navigation.view.selected == 1
-            results.highlighted = 1
-            await pilot.press("f")
+            assert app.navigation.view.selected == 0
+            results.highlighted = 0
+            await pilot.press("ctrl+f")
             await wait_until(lambda: not app.favorites.contains(deep))
             assert Favorites(favorites_file).paths == []
             await pilot.press("ctrl+l", "f")
@@ -352,7 +356,7 @@ def test_tui_executable_confirmation_and_normal_open(project):
             await pilot.press("enter")
             assert isinstance(app.screen, ConfirmOpen)
             assert opened == []
-            await pilot.press("alt+left", "alt+right", "ctrl+e", "f")
+            await pilot.press("alt+left", "alt+right", "ctrl+e", "ctrl+f", "alt+2", "ctrl+tab")
             assert isinstance(app.screen, ConfirmOpen)
             assert app.navigation.view.directory == root
             assert len(app.navigation.history) == 1
@@ -409,7 +413,7 @@ def test_all_errors_modal_preserves_navigation_and_favorites(project, kind):
             error_list = app.screen.query_one("#error-list", OptionList)
             assert error_list.option_count == len(errors)
             assert errors[-1] in str(error_list.get_option_at_index(29).prompt)
-            await pilot.press("end", "enter", "f", "backspace", "alt+left", "alt+right", "ctrl+l")
+            await pilot.press("end", "enter", "f", "ctrl+f", "backspace", "alt+left", "alt+right", "ctrl+l", "alt+2")
             assert isinstance(app.screen, ErrorDetails)
             assert app.navigation.view is view
             assert app.navigation.view.selected == selected
@@ -458,8 +462,8 @@ def test_tui_mouse_click_enters_folder(project):
         async with app.run_test(size=(110, 40)) as pilot:
             await wait_until(lambda: app.config is not None)
             await pilot.pause()
-            # 前兩列是最愛與根目錄標題；每個根目錄使用兩行。
-            clicked = await pilot.click("#results", offset=(5, 3))
+            # 根目錄直接列在資料夾分頁，每個項目顯示名稱、更新時間與路徑。
+            clicked = await pilot.click("#results", offset=(5, 1))
             assert clicked
             await wait_until(lambda: app.navigation.view.kind == "browse" and app.navigation.view.report is not None)
             assert app.navigation.view.directory == config.roots[0].path
@@ -522,7 +526,7 @@ def test_tui_returns_to_folder_by_reading_current_children(project):
     asyncio.run(scenario())
 
 
-def test_tui_open_failure_and_file_favorite_rejection(project):
+def test_tui_open_failure_and_file_favorite_persistence(project):
     config, file = project
     root = config.roots[0].path
     (root / "report.txt").touch()
@@ -537,11 +541,12 @@ def test_tui_open_failure_and_file_favorite_rejection(project):
             app.query_one(OptionList).focus()
             await pilot.press("enter")
             await wait_until(lambda: app.navigation.view.report is not None)
-            await pilot.press("f")
-            assert "不能收藏單一檔案" in app.navigation.view.status
+            await pilot.press("ctrl+f")
+            await wait_until(lambda: app.favorites.contains(root / "report.txt"))
+            assert Favorites(file.with_name("favorites.json")).contains(root / "report.txt")
             await pilot.press("enter")
             await wait_until(lambda: "無法讀取" in app.navigation.view.status)
-            assert app.favorites.paths == []
+            assert app.favorites.paths == [root / "report.txt"]
 
     asyncio.run(scenario())
 
@@ -557,11 +562,151 @@ def test_tui_invalid_root_and_invalid_favorite_are_retained(project):
         async with app.run_test(size=(110, 40)) as pilot:
             await wait_until(lambda: app.config is not None)
             assert app.favorites.paths == [lost]
-            assert app.navigation.view.items[1].error
+            assert app.navigation.view.items[0].error
             assert "無法讀取" in app.navigation.view.status
             app.query_one(OptionList).focus()
             await pilot.press("enter")
             await wait_until(lambda: app.navigation.view.report is not None)
             assert app.navigation.view.report.errors
+            await pilot.press("alt+2")
+            await wait_until(lambda: bool(app.navigation.view.items))
+            assert app.navigation.view.items[0].path == lost
+            assert app.navigation.view.items[0].error
+            assert app.navigation.view.items[0].modified_text == "無法取得"
+            app.query_one(OptionList).focus()
+            await pilot.press("ctrl+f")
+            await wait_until(lambda: not app.favorites.contains(lost))
+
+    asyncio.run(scenario())
+
+
+def test_tui_type_and_paste_from_list_or_menu(project):
+    """不先點輸入框也能搜尋；第一個字、空白與 f 都必須保留。"""
+    config, file = project
+    target = config.roots[0].path / "file report.xlsx"
+    target.touch()
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            app.query_one(OptionList).focus()
+            await pilot.press("f", "i", "l", "e", "space", "r", "e", "p", "o", "r", "t")
+            assert app.query_one(Input).value == "file report"
+            assert isinstance(app.focused, Input)
+            assert app.favorites.paths == []
+            await wait_until(lambda: app.navigation.view.report is not None)
+            assert [item.path for item in app.navigation.view.items] == [target]
+            await pilot.press("escape")
+            app.query_one(Tabs).focus()
+            await pilot.press("f")
+            assert app.query_one(Input).value == "f"
+            await pilot.press("escape")
+            app.query_one(OptionList).focus()
+            # 貼上由終端送到 App，再交給目前焦點元件處理。
+            app.post_message(events.Paste("file\nreport"))
+            await wait_until(lambda: app.query_one(Input).value == "file report")
+            await wait_until(lambda: app.navigation.view.report is not None)
+            assert app.navigation.view.items[0].path == target
+
+    asyncio.run(scenario())
+
+
+def test_tabs_keep_separate_search_history_and_ignore_old_results(project, monkeypatch):
+    """切分頁須取消舊搜尋，各分頁只還原自己的查詢及瀏覽歷史。"""
+    config, file = project
+    folder = config.roots[0].path / "2026_契變"
+    folder.mkdir()
+    started, release = Event(), Event()
+    Favorites(file.with_name("favorites.json")).toggle(folder)
+    original = main.scan_names
+
+    def controlled_scan(config, query, cancel, progress=None):
+        if query == "old":
+            started.set()
+            release.wait(5)
+            return ScanReport((Item(config.roots[0].path / "OLD.txt", False),), 1)
+        return original(config, query, cancel, progress)
+
+    monkeypatch.setattr(main, "scan_names", controlled_scan)
+
+    async def scenario():
+        app = FileFinderApp(file)
+        try:
+            async with app.run_test(size=(110, 40)) as pilot:
+                await wait_until(lambda: app.config is not None)
+                app.query_one(Input).value = "old"
+                await wait_until(started.is_set)
+                old_generation = app.gate.generation
+                old_cancel = app.gate.cancel
+                await pilot.click("#favorites")
+                await wait_until(lambda: app.active_menu == "favorites" and bool(app.navigation.view.items))
+                assert old_cancel.is_set()
+                app.query_one(Input).value = "契變 2026"
+                await wait_until(lambda: app.navigation.view.report is not None)
+                assert app.navigation.view.items[0].path == folder
+                release.set()
+                app.post_message(IOResult(old_generation, "search", ScanReport((Item(Path("OLD.txt"), False),), 1)))
+                await pilot.pause()
+                assert app.navigation.view.items[0].path == folder
+                app.query_one(OptionList).focus()
+                await pilot.press("enter")
+                await wait_until(lambda: app.navigation.view.kind == "browse" and app.navigation.view.report is not None)
+                await pilot.press("alt+1")
+                await wait_until(lambda: app.active_menu == "folders" and app.navigation.view.report is not None)
+                assert app.query_one(Input).value == "old"
+                assert app.navigation.history == []
+                await pilot.press("ctrl+tab")
+                await wait_until(lambda: app.active_menu == "favorites" and app.navigation.view.report is not None)
+                assert app.navigation.view.directory == folder
+                assert len(app.navigation.history) == 1
+                await pilot.press("alt+left")
+                await wait_until(lambda: app.navigation.view.kind == "search")
+                assert app.query_one(Input).value == "契變 2026"
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_favorites_tab_filters_saved_names_opens_file_and_removes_match(project):
+    """收藏檔案可直接開啟；收藏搜尋不掃描資料夾內未收藏的檔案。"""
+    config, file = project
+    root = config.roots[0].path
+    folder = root / "2026_契變"
+    folder.mkdir()
+    child = folder / "2026_契變_未收藏.xlsx"
+    child.touch()
+    saved = root / "契變 2026.xlsx"
+    saved.touch()
+    unrelated = root / "契變.xlsx"
+    unrelated.touch()
+    store = Favorites(file.with_name("favorites.json"))
+    for path in (saved, folder, unrelated):
+        store.toggle(path)
+    opened = []
+
+    async def scenario():
+        app = FileFinderApp(file, opener=opened.append)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            await pilot.press("alt+2")
+            await wait_until(lambda: len(app.navigation.view.items) == 3)
+            assert app.navigation.view.items[0].path == folder
+            assert all(item.modified_at is not None for item in app.navigation.view.items)
+            for item, option in zip(app.navigation.view.items, app.query_one(OptionList).options):
+                assert f"更新：{item.modified_text}" in str(option.prompt)
+            app.query_one(Input).value = "契變 2026"
+            await wait_until(lambda: app.navigation.view.report is not None)
+            assert [item.path for item in app.navigation.view.items] == [folder, saved]
+            results = app.query_one(OptionList)
+            results.focus()
+            results.highlighted = 1
+            await pilot.press("enter")
+            await wait_until(lambda: opened == [str(saved)])
+            await pilot.press("ctrl+f")
+            await wait_until(lambda: app.navigation.view.report is not None and len(app.navigation.view.items) == 1)
+            assert app.navigation.view.items[0].path == folder
+            assert not Favorites(store.file).contains(saved)
 
     asyncio.run(scenario())

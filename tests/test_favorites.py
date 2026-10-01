@@ -1,4 +1,4 @@
-"""驗證收藏僅限資料夾、正規化、原子保存與損壞保護。"""
+"""驗證檔案／資料夾收藏、正規化、原子保存與損壞保護。"""
 
 import json
 from pathlib import Path
@@ -41,13 +41,17 @@ def test_loading_duplicate_paths_and_toggle_alias(tmp_path):
     assert json.loads(file.read_text(encoding="utf-8")) == []
 
 
-def test_reject_file_and_missing_folder(tmp_path):
+def test_file_favorite_reload_and_missing_path_rejection(tmp_path):
     file = tmp_path / "report.txt"
     file.touch()
     store = Favorites(tmp_path / "favorites.json")
-    for invalid in (file, tmp_path / "missing"):
-        with pytest.raises(ValueError, match="只能收藏"):
-            store.toggle(invalid)
+    assert store.toggle(file)
+    assert Favorites(store.file).contains(file)
+    file.unlink()
+    # 檔案失效後仍可明確移除；加入新的失效路徑則拒絕。
+    assert not store.toggle(file)
+    with pytest.raises(ValueError, match="只能收藏"):
+        store.toggle(tmp_path / "missing")
     assert store.paths == []
 
 
