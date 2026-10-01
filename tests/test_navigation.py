@@ -1,6 +1,7 @@
 """驗證 Lazy Loading、歷史與 Textual 真實事件迴圈操作。"""
 
 import asyncio
+import json
 from pathlib import Path
 from threading import Event
 
@@ -8,8 +9,10 @@ import pytest
 from textual import events
 from textual.widgets import Input, OptionList, Static, Tabs
 
+import backend
 import main
-from main import Config, ConfirmOpen, ErrorDetails, Favorites, FileFinderApp, IOResult, Item, Navigation, Root, ScanReport, SearchProgress, View, browse_folder
+from backend import Config, Favorites, Item, Root, ScanReport, SearchProgress, browse_folder
+from main import ConfirmOpen, ErrorDetails, FileFinderApp, IOResult, Navigation, View
 
 
 async def wait_until(predicate, timeout=5):
@@ -51,7 +54,7 @@ def test_browse_io_failure_is_clear(tmp_path, monkeypatch, error):
     def denied(path):
         raise error
 
-    monkeypatch.setattr(main.os, "scandir", denied)
+    monkeypatch.setattr(backend.os, "scandir", denied)
     report = browse_folder(tmp_path)
     assert report.errors and not report.complete
     assert str(tmp_path) in FileFinderApp.browse_status(report)
@@ -160,7 +163,7 @@ def test_tui_debounce_responsiveness_and_stale_result_guard(project, monkeypatch
             return ScanReport((Item(config.roots[0].path / "OLD.txt", False),), 1)
         return ScanReport((Item(config.roots[0].path / "NEW.txt", False),), 1)
 
-    monkeypatch.setattr(main, "scan_names", slow_scan)
+    monkeypatch.setattr(backend, "scan_names", slow_scan)
 
     async def scenario():
         app = FileFinderApp(file)
@@ -216,7 +219,7 @@ def test_live_progress_elapsed_time_stale_messages_and_final_status(project, mon
         release_new.wait(5)
         return ScanReport((Item(config.roots[1].path / "new.txt", False),), total=4, scanned=8)
 
-    monkeypatch.setattr(main, "scan_names", controlled_scan)
+    monkeypatch.setattr(backend, "scan_names", controlled_scan)
 
     async def scenario():
         app = FileFinderApp(file)
@@ -275,7 +278,7 @@ def test_escape_during_progress_keeps_homepage(project, monkeypatch):
         progress(SearchProgress(999, 999))
         return ScanReport(total=999, cancelled=cancel.is_set())
 
-    monkeypatch.setattr(main, "scan_names", controlled_scan)
+    monkeypatch.setattr(backend, "scan_names", controlled_scan)
 
     async def scenario():
         app = FileFinderApp(file)
@@ -477,13 +480,13 @@ def test_startup_input_and_escape_do_not_cancel_initialization(project, monkeypa
     config, file = project
     (config.roots[0].path / "report.txt").touch()
     release = Event()
-    original = main.load_config
+    original = backend.load_config
 
     def delayed(path):
         release.wait(5)
         return original(path)
 
-    monkeypatch.setattr(main, "load_config", delayed)
+    monkeypatch.setattr(backend, "load_config", delayed)
 
     async def scenario():
         app = FileFinderApp(file)
@@ -555,7 +558,7 @@ def test_tui_invalid_root_and_invalid_favorite_are_retained(project):
     config, file = project
     config.roots[0].path.rmdir()
     lost = config.roots[0].path / "lost"
-    file.with_name("favorites.json").write_text(main.json.dumps([str(lost)]), encoding="utf-8")
+    file.with_name("favorites.json").write_text(json.dumps([str(lost)]), encoding="utf-8")
 
     async def scenario():
         app = FileFinderApp(file)
@@ -619,7 +622,7 @@ def test_tabs_keep_separate_search_history_and_ignore_old_results(project, monke
     folder.mkdir()
     started, release = Event(), Event()
     Favorites(file.with_name("favorites.json")).toggle(folder)
-    original = main.scan_names
+    original = backend.scan_names
 
     def controlled_scan(config, query, cancel, progress=None):
         if query == "old":
@@ -628,7 +631,7 @@ def test_tabs_keep_separate_search_history_and_ignore_old_results(project, monke
             return ScanReport((Item(config.roots[0].path / "OLD.txt", False),), 1)
         return original(config, query, cancel, progress)
 
-    monkeypatch.setattr(main, "scan_names", controlled_scan)
+    monkeypatch.setattr(backend, "scan_names", controlled_scan)
 
     async def scenario():
         app = FileFinderApp(file)
@@ -708,5 +711,120 @@ def test_favorites_tab_filters_saved_names_opens_file_and_removes_match(project)
             await wait_until(lambda: app.navigation.view.report is not None and len(app.navigation.view.items) == 1)
             assert app.navigation.view.items[0].path == folder
             assert not Favorites(store.file).contains(saved)
+
+    asyncio.run(scenario())
+
+
+def test_click_favorites_then_down_focuses_file_list(project):
+    """滑鼠選取分頁後，向下鍵直接進清單；再次向下才移到下一筆。"""
+    config, file = project
+    store = Favorites(file.with_name("favorites.json"))
+    for name in ("a.xlsx", "b.xlsx"):
+        path = config.roots[0].path / name
+        path.touch()
+        store.toggle(path)
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            await pilot.click("#favorites")
+            await wait_until(lambda: app.active_menu == "favorites" and len(app.navigation.view.items) == 2)
+            await pilot.press("down")
+            results = app.query_one(OptionList)
+            assert app.focused is results
+            assert results.highlighted == 0
+            await pilot.press("down")
+            assert results.highlighted == 1
+            # 分頁本身保有焦點時也適用，不依賴點擊後焦點剛好位於 Input。
+            app.query_one(Tabs).focus()
+            await pilot.press("down")
+            assert app.focused is results
+            assert results.highlighted == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("menu", ["folders", "favorites"])
+def test_escape_returns_one_level_and_double_escape_returns_tab_home(project, monkeypatch, menu):
+    """慢速單按 Esc 逐層退回；快速連按兩次則直接回目前分頁首頁。"""
+    config, file = project
+    root = config.roots[0].path
+    first, second = root / "first", root / "first" / "second"
+    second.mkdir(parents=True)
+    Favorites(file.with_name("favorites.json")).toggle(root)
+    clock = [10.0]
+    monkeypatch.setattr(main, "monotonic", lambda: clock[0])
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            if menu == "favorites":
+                await pilot.click("#favorites")
+                await wait_until(lambda: app.active_menu == menu and bool(app.navigation.view.items))
+            await pilot.press("down")
+            for folder in (root, first, second):
+                await pilot.press("enter")
+                await wait_until(lambda: app.navigation.view.directory == folder and app.navigation.view.report is not None)
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.directory == first and app.navigation.view.report is not None)
+            assert app.active_menu == menu
+            assert len(app.navigation.history) == 2
+            assert app.navigation.forward_history[-1].directory == second
+            clock[0] += 1.0
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.directory == root and app.navigation.view.report is not None)
+            assert app.navigation.view.kind == "browse"
+            # 重新深入；其他按鍵會重設連按判定。
+            for folder in (first, second):
+                await pilot.press("enter")
+                await wait_until(lambda: app.navigation.view.directory == folder and app.navigation.view.report is not None)
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.directory == first)
+            clock[0] += 0.1
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
+            assert app.active_menu == menu
+            assert app.query_one(Tabs).active == menu
+            assert app.query_one(Input).value == ""
+            assert not app.navigation.history
+            assert not app.navigation.forward_history
+
+    asyncio.run(scenario())
+
+
+def test_escape_restores_search_and_intervening_key_cancels_double_escape(project, monkeypatch):
+    """單次返回保留搜尋與選取；兩次 Esc 中有其他按鍵不算連按。"""
+    config, file = project
+    parent = config.roots[0].path / "report"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    clock = [10.0]
+    monkeypatch.setattr(main, "monotonic", lambda: clock[0])
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await wait_until(lambda: app.config is not None)
+            app.query_one(Input).value = "report"
+            await wait_until(lambda: app.navigation.view.report is not None)
+            await pilot.press("down", "enter")
+            await wait_until(lambda: app.navigation.view.directory == parent and app.navigation.view.report is not None)
+            await pilot.press("enter")
+            await wait_until(lambda: app.navigation.view.directory == child and app.navigation.view.report is not None)
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.directory == parent)
+            await pilot.press("ctrl+l")
+            clock[0] += 0.1
+            await pilot.press("escape")
+            assert app.navigation.view.kind == "search"
+            assert app.query_one(Input).value == "report"
+            assert app.navigation.view.items[0].path == parent
+            assert app.navigation.view.selected == 0
+            assert app.navigation.forward_history
+            clock[0] += 1.0
+            await pilot.press("escape")
+            await wait_until(lambda: app.navigation.view.kind == "home" and bool(app.navigation.view.items))
 
     asyncio.run(scenario())

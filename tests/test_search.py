@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import backend
 import main
-from main import Config, Item, RequestGate, Root, entry_item, load_config, match_rank, scan_names
+from backend import Config, Item, Root, entry_item, load_config, match_rank, scan_names
+from main import RequestGate
 
 
 @pytest.mark.parametrize("query,name,expected", [
@@ -83,7 +85,7 @@ def test_search_and_browse_capture_filesystem_modified_time(project):
     by_path = {item.path: item for item in report.items}
     assert by_path[file].modified_at == file.stat().st_mtime
     assert by_path[folder].modified_at == folder.stat().st_mtime
-    assert main.browse_folder(folder).items[0].modified_at == file.stat().st_mtime
+    assert backend.browse_folder(folder).items[0].modified_at == file.stat().st_mtime
     assert Item(file, False).modified_text == "無法取得"
 
 
@@ -118,7 +120,7 @@ def test_cancellation_during_scan(project, monkeypatch):
     for number in range(10):
         (config.roots[0].path / f"item{number}").touch()
     cancel = Event()
-    original = main.entry_item
+    original = backend.entry_item
     calls = []
 
     def stop_after_first(entry):
@@ -126,7 +128,7 @@ def test_cancellation_during_scan(project, monkeypatch):
         cancel.set()
         return original(entry)
 
-    monkeypatch.setattr(main, "entry_item", stop_after_first)
+    monkeypatch.setattr(backend, "entry_item", stop_after_first)
     report = scan_names(config, "item", cancel)
     assert len(calls) == 1
     assert report.cancelled and not report.complete
@@ -163,7 +165,7 @@ def test_progress_is_throttled_during_fast_scan(project, monkeypatch):
     config, _ = project
     for number in range(50):
         (config.roots[0].path / f"report{number}.txt").touch()
-    monkeypatch.setattr(main, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(backend, "monotonic", lambda: 10.0)
     snapshots = []
     report = scan_names(config, "report", progress=snapshots.append)
     assert len(snapshots) == 2
@@ -176,7 +178,7 @@ def test_progress_advances_during_scan_and_stops_after_cancel(project, monkeypat
     for number in range(20):
         (config.roots[0].path / f"report{number}.txt").touch()
     clock = [0.0]
-    original = main.entry_item
+    original = backend.entry_item
     cancel = Event()
     snapshots = []
 
@@ -190,8 +192,8 @@ def test_progress_advances_during_scan_and_stops_after_cancel(project, monkeypat
         if snapshot.scanned >= 4:
             cancel.set()
 
-    monkeypatch.setattr(main, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(main, "entry_item", slow_entry)
+    monkeypatch.setattr(backend, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(backend, "entry_item", slow_entry)
     report = scan_names(config, "report", cancel, progress)
     assert len(snapshots) >= 3
     assert snapshots[0].scanned == 0
@@ -235,7 +237,7 @@ def test_unreadable_directory_keeps_other_results(project, monkeypatch, error):
             raise error
         return original(path)
 
-    monkeypatch.setattr(main.os, "scandir", denied)
+    monkeypatch.setattr(backend.os, "scandir", denied)
     report = scan_names(config, "report")
     assert report.total == 1
     assert not report.complete and len(report.errors) == 1
@@ -257,7 +259,7 @@ def test_reparse_point_is_excluded():
 
         def stat(self, follow_symlinks):
             assert not follow_symlinks
-            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=main.REPARSE_POINT)
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=backend.REPARSE_POINT)
 
         def is_symlink(self):
             return False
@@ -309,7 +311,7 @@ def test_config_valid_missing_and_malformed(project, tmp_path):
 
 def test_check_cli_does_not_scan_recursively(project, monkeypatch, capsys):
     config, file = project
-    monkeypatch.setattr(main, "scan_names", lambda *args: pytest.fail("設定驗證不得遞迴掃描"))
+    monkeypatch.setattr(backend, "scan_names", lambda *args: pytest.fail("設定驗證不得遞迴掃描"))
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--config", str(file), "--check"])
     assert main.main() == 0
     assert "可讀取" in capsys.readouterr().out
@@ -322,6 +324,17 @@ def test_favorites_do_not_expand_search_scope(project, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret_report.txt").touch()
-    store = main.Favorites(tmp_path / "favorites.json")
+    store = backend.Favorites(tmp_path / "favorites.json")
     store.toggle(outside)
     assert scan_names(config, "report").total == 0
+
+
+def test_backend_loads_without_third_party_packages():
+    """停用 site-packages 後仍能載入後端，確保後端沒有依賴 Textual。"""
+    result = subprocess.run(
+        [main.sys.executable, "-S", "-c", "import backend; assert backend.match_rank('契變 2026', '2026_契變.xlsx') is not None"],
+        cwd=Path(backend.__file__).parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
