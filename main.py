@@ -218,6 +218,7 @@ class FileFinderApp(App):
     #location { height: auto; max-height: 3; margin: 0 2; color: $text-muted; }
     #results { height: 1fr; margin: 0 2; border: round $border-blurred; background: $surface; scrollbar-size-vertical: 1; }
     #results:focus { border: round $primary; background-tint: transparent; }
+    #results > .option-list--option { padding: 0 1; }
     #results > .option-list--option-disabled { color: $primary; text-style: bold; }
     #status { height: auto; max-height: 5; margin: 0 2; padding: 0 1; background: $panel; color: $foreground; }
     #keys { height: auto; margin: 0 2 1 2; padding: 0 1; color: $text-muted; }
@@ -235,6 +236,7 @@ class FileFinderApp(App):
         Binding("alt+1", "menu('folders')", "資料夾", priority=True),
         Binding("alt+2", "menu('favorites')", "我的最愛", priority=True),
         Binding("ctrl+tab", "next_menu", "切換分頁", priority=True),
+        Binding("f5", "refresh", "更新", priority=True),
         Binding("backspace", "back", "返回", show=False),
     ]
 
@@ -253,6 +255,7 @@ class FileFinderApp(App):
         self.navigation = self.navigations[self.active_menu]
         self.menu_inputs = {"folders": "", "favorites": ""}
         self.gate = RequestGate()
+        self.directory_index = backend.DirectoryIndex()
         self.debounce_timer = None
         self.favorite_busy = False
         self.last_escape_at: float | None = None
@@ -265,7 +268,7 @@ class FileFinderApp(App):
         yield Static(f"首頁\n設定檔：{self.config_path}", id="location", markup=False)
         yield OptionList(id="results", markup=False)
         yield Static("正在驗證設定與根目錄…", id="status", markup=False)
-        yield Static("直接打字搜尋 | ↑↓ 選取 | Enter 開啟 | Ctrl+F 收藏／移除 | Backspace／Alt+← 返回 | Alt+→ 前進\nAlt+1 資料夾 | Alt+2 我的最愛 | Ctrl+Tab 切分頁 | Esc 上一層／連按兩次回首頁 | Ctrl+L 搜尋 | Ctrl+E 錯誤 | Ctrl+Q 結束", id="keys", markup=False)
+        yield Static("直接打字搜尋 | ↑↓ 選取 | Enter 開啟 | Ctrl+F 收藏／移除 | F5 更新 | Backspace／Alt+← 返回 | Alt+→ 前進\nAlt+1 資料夾 | Alt+2 我的最愛 | Ctrl+Tab 切分頁 | Esc 上一層／連按兩次回首頁 | Ctrl+L 搜尋 | Ctrl+E 錯誤 | Ctrl+Q 結束", id="keys", markup=False)
 
     def on_mount(self) -> None:
         self.set_interval(PROGRESS_INTERVAL_SECONDS, self.refresh_search_progress)
@@ -278,7 +281,7 @@ class FileFinderApp(App):
         try:
             config = backend.load_config(self.config_path)
             favorites = Favorites(self.favorites_path)
-            payload = (config, favorites, backend.list_home_items(config, favorites, cancel), "")
+            payload = (config, favorites, backend.list_home_items(config, favorites, cancel, index=self.directory_index), "")
         except ValueError as error:
             payload = (None, None, (), str(error))
         self.post_message(IOResult(generation, "initialize", payload))
@@ -334,6 +337,8 @@ class FileFinderApp(App):
             status += f"\n掃描資料夾：{progress.directory}"
         if progress.errors or progress.skipped_links:
             status += f"\n讀取錯誤 {progress.errors} 項；已排除 {progress.skipped_links} 個連結／reparse point"
+        if progress.cached_directories or progress.read_directories:
+            status += f"\n重用 {progress.cached_directories} 個資料夾快取，新讀取 {progress.read_directories} 個資料夾"
         self.set_status(status)
 
     @work(thread=True, exclusive=True, group="io")
@@ -342,18 +347,18 @@ class FileFinderApp(App):
             self.post_message(IOResult(generation, "progress", snapshot))
 
         if menu == "favorites":
-            report = backend.search_favorites(self.favorites, query, cancel)
+            report = backend.search_favorites(self.favorites, query, cancel, self.directory_index)
         else:
-            report = backend.scan_names(self.config, query, cancel, progress)
+            report = backend.scan_names(self.config, query, cancel, progress, self.directory_index)
         self.post_message(IOResult(generation, "search", report))
 
     @work(thread=True, exclusive=True, group="io")
     def load_home(self, generation: int, cancel: Event, menu: str) -> None:
-        self.post_message(IOResult(generation, "home", backend.list_home_items(self.config, self.favorites, cancel, menu)))
+        self.post_message(IOResult(generation, "home", backend.list_home_items(self.config, self.favorites, cancel, menu, self.directory_index)))
 
     @work(thread=True, exclusive=True, group="io")
     def load_folder(self, generation: int, directory: Path, cancel: Event) -> None:
-        self.post_message(IOResult(generation, "browse", backend.browse_folder(directory, cancel)))
+        self.post_message(IOResult(generation, "browse", backend.browse_folder(directory, cancel, self.directory_index)))
 
     @on(IOResult)
     def on_io_result(self, message: IOResult) -> None:
@@ -406,6 +411,10 @@ class FileFinderApp(App):
             text += f"；{len(report.errors)} 項錯誤；Ctrl+E 查看全部錯誤\n{report.errors[0]}"
         if report.skipped_links:
             text += f"；已排除 {report.skipped_links} 個連結／reparse point"
+        if report.cached_directories:
+            text += "；使用已掃描快取，F5 更新"
+        elif report.read_directories:
+            text += "；已建立資料夾快取"
         return text
 
     def set_status(self, text: str) -> None:
@@ -425,7 +434,12 @@ class FileFinderApp(App):
             label = item.label or item.name
             # 首頁根目錄顯示完整搜尋路徑；檔案與子項目顯示父目錄以區分同名項目。
             location = item.path if view.kind == "home" and self.active_menu == "folders" else item.path.parent
-            prompt = f"{icon} {label}{star}{invalid}\n  更新：{item.modified_text}\n  {location}"
+            prompt = f"{icon} {label}{star}{invalid}\n  更新：{item.modified_text}"
+            if view.kind != "browse":
+                # 同一資料夾內的路徑只顯示在上方；跨目錄搜尋仍保留路徑以辨識同名檔。
+                prompt += f"\n  {location}"
+            # 留白屬於同一筆選項，方向鍵不會選到額外的空白列。
+            prompt += "\n "
             options.append(Option(prompt))
         results = self.query_one(OptionList)
         previous = view.selected
@@ -537,6 +551,23 @@ class FileFinderApp(App):
         if not isinstance(self.screen, ModalScreen):
             self.query_one(Input).focus()
 
+    def action_refresh(self) -> None:
+        """只有使用者按 F5 才使索引失效；瀏覽時只更新當前資料夾。"""
+        if isinstance(self.screen, ModalScreen) or self.config is None:
+            return
+        view = self.navigation.view
+        generation, cancel = self.invalidate()
+        self.directory_index.invalidate(view.directory if view.kind == "browse" else None)
+        if view.kind == "browse":
+            view.report = None
+            self.set_status("正在更新目前資料夾…")
+            self.load_folder(generation, view.directory, cancel)
+        elif view.kind == "search":
+            view.report = None
+            self.start_search(generation, view.query, cancel)
+        else:
+            self.load_home(generation, cancel, self.active_menu)
+
     def action_escape(self) -> None:
         """單次退回一個瀏覽層級；0.5 秒內連按兩次才直接回分頁首頁。"""
         if isinstance(self.screen, ModalScreen):
@@ -604,7 +635,7 @@ class FileFinderApp(App):
         self.set_input(view.query)
         self.render_view()
         if view.kind == "browse":
-            # 返回資料夾也重新讀取，不依賴之前的資料夾快取。
+            # 重新呈現同一份共用索引；只有未完整掃過或按 F5 才讀取磁碟。
             self.load_folder(generation, view.directory, cancel)
         elif view.kind == "home":
             self.load_home(generation, cancel, self.active_menu)
