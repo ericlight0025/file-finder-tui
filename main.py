@@ -23,7 +23,7 @@ from textual.widgets.option_list import Option
 
 
 import backend
-from backend import Config, Favorites, Item, ScanReport, SearchProgress, PROGRESS_INTERVAL_SECONDS
+from backend import Config, Favorites, Item, ScanReport, SearchProgress, PROGRESS_INTERVAL_SECONDS, display_text
 
 
 DEBOUNCE_SECONDS = 0.25
@@ -161,7 +161,7 @@ class ConfirmOpen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Static(f"此檔案可能執行程式、腳本或捷徑目標。確定要開啟嗎？\n\n{self.path}", markup=False)
+            yield Static(f"此檔案可能執行程式、腳本或捷徑目標。確定要開啟嗎？\n\n{display_text(self.path)}", markup=False)
             with Horizontal():
                 yield Button("取消", id="cancel")
                 yield Button("確認開啟", id="confirm", variant="warning")
@@ -192,7 +192,7 @@ class ErrorDetails(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(f"讀取錯誤（共 {len(self.errors)} 項）", markup=False)
-            yield OptionList(*(Option(f"{index}. {error}") for index, error in enumerate(self.errors, 1)), id="error-list", markup=False)
+            yield OptionList(*(Option(f"{index}. {display_text(error)}") for index, error in enumerate(self.errors, 1)), id="error-list", markup=False)
             yield Static("↑↓／PageUp／PageDown 捲動 | Esc 返回", markup=False)
             yield Button("返回", id="error-close")
 
@@ -265,7 +265,7 @@ class FileFinderApp(App):
         yield Static("File Finder", id="title")
         yield Tabs(Tab("資料夾", id="folders"), Tab("★ 我的最愛", id="favorites"), active="folders", id="menu", disabled=True)
         yield Input(placeholder="搜尋名稱；空白分隔的關鍵字須全部符合…", id="search", select_on_focus=False)
-        yield Static(f"首頁\n設定檔：{self.config_path}", id="location", markup=False)
+        yield Static(f"首頁\n設定檔：{display_text(self.config_path)}", id="location", markup=False)
         yield OptionList(id="results", markup=False)
         yield Static("正在驗證設定與根目錄…", id="status", markup=False)
         yield Static("直接打字搜尋 | ↑↓ 選取 | Enter 開啟 | Ctrl+F 收藏／移除 | F5 更新 | Backspace／Alt+← 返回 | Alt+→ 前進\nAlt+1 資料夾 | Alt+2 我的最愛 | Ctrl+Tab 切分頁 | Esc 上一層／連按兩次回首頁 | Ctrl+L 搜尋 | Ctrl+E 錯誤 | Ctrl+Q 結束", id="keys", markup=False)
@@ -334,7 +334,7 @@ class FileFinderApp(App):
         elapsed = max(0.0, monotonic() - view.search_started)
         status = f"正在搜尋…耗時 {elapsed:.1f} 秒；已掃描 {progress.scanned} 個項目；目前找到至少 {progress.found} 筆（尚未完成）"
         if progress.directory is not None:
-            status += f"\n掃描資料夾：{progress.directory}"
+            status += f"\n掃描資料夾：{display_text(progress.directory)}"
         if progress.errors or progress.skipped_links:
             status += f"\n讀取錯誤 {progress.errors} 項；已排除 {progress.skipped_links} 個連結／reparse point"
         if progress.cached_directories or progress.read_directories:
@@ -419,7 +419,7 @@ class FileFinderApp(App):
 
     def set_status(self, text: str) -> None:
         self.navigation.view.status = text
-        self.query_one("#status", Static).update("狀態：" + text)
+        self.query_one("#status", Static).update("狀態：" + display_text(text, multiline=True))
 
     def render_view(self) -> None:
         view = self.navigation.view
@@ -431,13 +431,13 @@ class FileFinderApp(App):
             star = " ★" if self.favorites and self.favorites.contains(item.path) else ""
             invalid = " [失效／無法讀取]" if item.error else ""
             icon = "📁" if item.is_dir else "📄"
-            label = item.label or item.name
+            label = display_text(item.label or item.name)
             # 首頁根目錄顯示完整搜尋路徑；檔案與子項目顯示父目錄以區分同名項目。
             location = item.path if view.kind == "home" and self.active_menu == "folders" else item.path.parent
             prompt = f"{icon} {label}{star}{invalid}\n  更新：{item.modified_text}"
             if view.kind != "browse":
                 # 同一資料夾內的路徑只顯示在上方；跨目錄搜尋仍保留路徑以辨識同名檔。
-                prompt += f"\n  {location}"
+                prompt += f"\n  {display_text(location)}"
             # 留白屬於同一筆選項，方向鍵不會選到額外的空白列。
             prompt += "\n "
             options.append(Option(prompt))
@@ -450,7 +450,7 @@ class FileFinderApp(App):
             results.action_first()
         view.selected = results.highlighted
         scope = "我的最愛名稱" if self.active_menu == "favorites" else "固定三個根目錄"
-        location = str(view.directory) if view.kind == "browse" else (f"搜尋：{view.query}（{scope}；關鍵字全部符合）" if view.kind == "search" else f"{'我的最愛' if self.active_menu == 'favorites' else '搜尋根目錄'}\n設定檔：{self.config_path}")
+        location = display_text(view.directory) if view.kind == "browse" else (f"搜尋：{display_text(view.query)}（{scope}；關鍵字全部符合）" if view.kind == "search" else f"{'我的最愛' if self.active_menu == 'favorites' else '搜尋根目錄'}\n設定檔：{display_text(self.config_path)}")
         self.query_one("#location", Static).update(location)
         self.set_status(view.status)
 
@@ -682,7 +682,7 @@ class FileFinderApp(App):
     def save_favorite(self, path: Path) -> None:
         try:
             added = self.favorites.toggle(path)
-            status = f"已{'加入' if added else '取消'}最愛：{path}"
+            status = f"已{'加入' if added else '取消'}最愛：{display_text(path)}"
         except ValueError as error:
             status = str(error)
         self.post_message(FavoriteResult(status))
@@ -719,7 +719,7 @@ def main() -> int:
         invalid = False
         for root in config.roots:
             error = backend.validate_folder(root.path)
-            print(f"{root.name}：{error or str(root.path) + '（可讀取）'}")
+            print(f"{display_text(root.name)}：{error or display_text(root.path) + '（可讀取）'}")
             invalid |= bool(error)
         return int(invalid)
     FileFinderApp(args.config).run()
