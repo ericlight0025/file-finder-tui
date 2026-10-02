@@ -29,11 +29,15 @@ from textual.widgets.option_list import Option
 
 
 import backend
-from backend import Config, Favorites, Item, ScanReport, SearchProgress, PROGRESS_INTERVAL_SECONDS, display_text
+from backend import Config, Favorites, Item, ScanReport, SearchOptions, SearchProgress, PROGRESS_INTERVAL_SECONDS, display_text
 
 
 DEBOUNCE_SECONDS = 0.25
 DOUBLE_ESCAPE_SECONDS = 0.5
+SCOPE_OPTIONS = (("範圍：全部", "all"), ("目前資料夾", "current"), ("包含子資料夾", "recursive"))
+KIND_OPTIONS = (("類型：全部", "all"), ("只看檔案", "files"), ("只看資料夾", "folders"),
+                ("SQL", "sql"), ("Word", "word"), ("Excel", "excel"))
+SORT_OPTIONS = (("排序：相關性", "relevance"), ("名稱", "name"), ("更新時間↓", "modified"))
 # 黑灰為主，僅在焦點與選取列使用低飽和霧藍。
 BLUE_THEME = Theme(
     name="file-finder-blue",
@@ -120,6 +124,8 @@ class View:
     selected: int | None = None
     progress: SearchProgress | None = None
     search_started: float | None = None
+    scope: str = "all"
+    options: SearchOptions = SearchOptions()
 
 
 class Navigation:
@@ -129,14 +135,21 @@ class Navigation:
         self.forward_history: list[View] = []
 
     def search(self, query: str) -> None:
-        self.history.clear()
+        previous = self.view
+        local = previous.directory is not None and previous.scope != "all"
+        if local and previous.kind == "browse":
+            self.history.append(replace(previous))
+        elif not local:
+            self.history.clear()
         self.forward_history.clear()
-        self.view = View("search", query=query, status="等待輸入完成…")
+        self.view = View("search", query=query, directory=previous.directory,
+                         scope=previous.scope, options=previous.options, status="等待輸入完成…")
 
     def enter(self, directory: Path) -> None:
         self.history.append(replace(self.view))
         self.forward_history.clear()
-        self.view = View("browse", directory=directory, status="正在讀取資料夾…")
+        self.view = View("browse", directory=directory, scope=self.view.scope,
+                         options=self.view.options, status="正在讀取資料夾…")
 
     def back(self) -> bool:
         if not self.history:
@@ -368,7 +381,7 @@ class FileFinderApp(App):
     TITLE = "File Finder"
     CSS = """
     Screen { layout: vertical; background: $background; color: $foreground; }
-    #menu-bar, #search, #location, #results, #help { width: 1fr; max-width: 76; }
+    #menu-bar, #search, #search-tools, #location, #results, #help { width: 1fr; max-width: 76; }
     #menu-bar { height: 3; margin: 1 1 0 1; }
     #menu { width: 1fr; }
     #theme-select { width: 24; height: 3; margin-left: 1; border: round $border-blurred; background: $surface; }
@@ -382,6 +395,10 @@ class FileFinderApp(App):
     #search { margin: 1 1; border: round $border-blurred; background: $surface; }
     #search:focus { border: round $finder-focus-border; background-tint: transparent; }
     #search > .input--placeholder { color: $text-muted; }
+    #search-tools { height: 3; margin: 0 1; }
+    #search-tools Select { width: 1fr; height: 3; border: round $border-blurred; background: $surface; }
+    #search-tools Select:focus-within { border: round $finder-focus-border; }
+    #search-tools SelectCurrent { padding: 0 1; }
     #location { height: auto; max-height: 3; margin: 0 1; color: $text-muted; }
     #results { height: 1fr; margin: 0 1; border: round $border-blurred; background: $surface; color: $foreground; scrollbar-size-vertical: 1; scrollbar-color: $scrollbar; scrollbar-color-hover: $scrollbar-hover; scrollbar-color-active: $scrollbar-active; scrollbar-background: $surface; scrollbar-background-hover: $surface; scrollbar-background-active: $surface; }
     #results:focus { border: round $finder-focus-border; background-tint: transparent; }
@@ -446,6 +463,13 @@ class FileFinderApp(App):
             yield Select([(label, theme.name) for label, theme in THEME_OPTIONS], value=BLUE_THEME.name,
                          allow_blank=False, compact=True, id="theme-select", tooltip="切換主題")
         yield Input(placeholder="搜尋名稱；空白分隔的關鍵字須全部符合…", id="search", select_on_focus=False)
+        with Horizontal(id="search-tools"):
+            yield Select(SCOPE_OPTIONS, value="all", allow_blank=False, compact=True,
+                         id="scope-select", disabled=True, tooltip="進入資料夾後可限制搜尋範圍")
+            yield Select(KIND_OPTIONS, value="all", allow_blank=False, compact=True,
+                         id="kind-select", disabled=True, tooltip="先篩選類型，再保留最佳 200 筆")
+            yield Select(SORT_OPTIONS, value="relevance", allow_blank=False, compact=True,
+                         id="sort-select", disabled=True, tooltip="資料夾仍在前；時間以索引為準，F5 核對")
         yield Static("", id="location", markup=False)
         yield FileList(id="results", markup=False)
         # 狀態持續更新，說明區預設收合以保留清單空間。
@@ -465,6 +489,41 @@ class FileFinderApp(App):
             self.theme = event.value
             self.refresh()
         event.stop()
+
+    @on(Select.Changed, "#scope-select, #kind-select, #sort-select")
+    def on_search_option_changed(self, event: Select.Changed) -> None:
+        """條件跟著分頁及歷史保存；切換立即使上一個背景結果失效。"""
+        if self.config is None:
+            return
+        view = self.navigation.view
+        if event.select.id == "scope-select":
+            if event.value not in {value for _, value in SCOPE_OPTIONS}:
+                return
+            if view.directory is None or (self.active_menu == "favorites" and view.kind == "home"):
+                return
+            view.scope = event.value
+            if view.kind == "search" and view.scope != "all" and not self.navigation.history:
+                self.navigation.history.append(View("browse", directory=view.directory,
+                                                    scope=view.scope, options=view.options))
+        else:
+            field = "kind" if event.select.id == "kind-select" else "sort"
+            view.options = replace(view.options, **{field: event.value})
+        event.stop()
+        generation, cancel = self.invalidate()
+        view.report = None
+        self.restore_navigation_view(generation, cancel, refresh=True)
+
+    def sync_search_controls(self) -> None:
+        """還原選單時不觸發新的查詢，也不讓首頁誤用不存在的目前資料夾。"""
+        view = self.navigation.view
+        with self.prevent(Select.Changed):
+            scope = self.query_one("#scope-select", Select)
+            scope.value = view.scope
+            scope.disabled = self.config is None or view.directory is None
+            for selector_id, value in (("kind-select", view.options.kind), ("sort-select", view.options.sort)):
+                selector = self.query_one(f"#{selector_id}", Select)
+                selector.value = value
+                selector.disabled = self.config is None
 
     @work(thread=True, exclusive=True, group="io")
     def initialize(self, generation: int, cancel: Event) -> None:
@@ -505,9 +564,23 @@ class FileFinderApp(App):
             self.render_view()
             self.debounce_timer = self.set_timer(DEBOUNCE_SECONDS, lambda: self.start_search(generation, query, cancel))
         else:
+            view = self.navigation.view
+            if view.kind == "search" and view.directory is not None and view.scope != "all":
+                # 清空局部查詢回到該資料夾，不跳到全域首頁。
+                if self.navigation.history and self.navigation.history[-1].directory == view.directory:
+                    self.navigation.back()
+                    self.navigation.view.scope = view.scope
+                    self.navigation.view.options = view.options
+                else:
+                    self.navigation.view = View("browse", directory=view.directory,
+                                                scope=view.scope, options=view.options)
+                self.restore_navigation_view(generation, cancel, refresh=True)
+                return
+            options = view.options
             self.navigation.home()
+            self.navigation.view.options = options
             self.render_view()
-            self.load_home(generation, cancel, self.active_menu)
+            self.load_home(generation, cancel, self.active_menu, options)
 
     def start_search(self, generation: int, query: str, cancel: Event) -> None:
         self.debounce_timer = None
@@ -515,7 +588,9 @@ class FileFinderApp(App):
             self.navigation.view.search_started = monotonic()
             self.navigation.view.progress = SearchProgress()
             self.refresh_search_progress()
-            self.search_worker(generation, query, cancel, self.active_menu)
+            view = self.navigation.view
+            self.search_worker(generation, query, cancel, self.active_menu,
+                               view.directory, view.scope, view.options)
 
     def refresh_search_progress(self) -> None:
         view = self.navigation.view
@@ -533,25 +608,30 @@ class FileFinderApp(App):
         self.set_status(status)
 
     @work(thread=True, exclusive=True, group="io")
-    def search_worker(self, generation: int, query: str, cancel: Event, menu: str) -> None:
+    def search_worker(self, generation: int, query: str, cancel: Event, menu: str,
+                      directory: Path | None = None, scope: str = "all", options: SearchOptions = SearchOptions()) -> None:
         def progress(snapshot: SearchProgress) -> None:
             self.post_message(IOResult(generation, "progress", snapshot))
 
-        if menu == "favorites":
-            report = backend.search_favorites(self.favorites, query, cancel, self.directory_index)
+        kwargs = {"options": options} if options != SearchOptions() else {}
+        if directory is not None and scope != "all":
+            report = backend.scan_names(self.config, query, cancel, progress, self.directory_index,
+                                        directory=directory, recursive=scope == "recursive", **kwargs)
+        elif menu == "favorites":
+            report = backend.search_favorites(self.favorites, query, cancel, self.directory_index, **kwargs)
         else:
-            report = backend.scan_names(self.config, query, cancel, progress, self.directory_index)
+            report = backend.scan_names(self.config, query, cancel, progress, self.directory_index, **kwargs)
         self.post_message(IOResult(generation, "search", report))
         self.directory_index.flush()
         self.post_message(IOResult(generation, "storage", None))
 
     @work(thread=True, exclusive=True, group="io")
-    def load_home(self, generation: int, cancel: Event, menu: str) -> None:
-        self.post_message(IOResult(generation, "home", backend.list_home_items(self.config, self.favorites, cancel, menu, self.directory_index)))
+    def load_home(self, generation: int, cancel: Event, menu: str, options: SearchOptions = SearchOptions()) -> None:
+        self.post_message(IOResult(generation, "home", backend.list_home_items(self.config, self.favorites, cancel, menu, self.directory_index, options=options)))
 
     @work(thread=True, exclusive=True, group="io")
-    def load_folder(self, generation: int, directory: Path, cancel: Event) -> None:
-        self.post_message(IOResult(generation, "browse", backend.browse_folder(directory, cancel, self.directory_index)))
+    def load_folder(self, generation: int, directory: Path, cancel: Event, options: SearchOptions = SearchOptions()) -> None:
+        self.post_message(IOResult(generation, "browse", backend.browse_folder(directory, cancel, self.directory_index, options=options)))
         self.directory_index.flush()
         self.post_message(IOResult(generation, "storage", None))
 
@@ -574,12 +654,18 @@ class FileFinderApp(App):
             self.query_one(Input).disabled = self.config is None
             self.query_one(Tabs).disabled = self.config is None
         elif message.kind == "home":
-            view.items = message.payload
+            removed = self.update_view_items(message.payload)
             view.status = self.home_status(view.items)
+            if removed:
+                view.status += "；原選取項目已不在清單，改選第一筆" if view.items else "；原選取項目已不在清單"
         elif message.kind in {"search", "browse"}:
             view.report = message.payload
-            view.items = view.report.items
+            removed = self.update_view_items(view.report.items)
             view.status = view.report.status() if message.kind == "search" else self.browse_status(view.report)
+            if message.kind == "browse" and not view.items and view.options.kind != "all" and view.report.complete:
+                view.status = "目前類型篩選沒有符合項目"
+            if removed:
+                view.status += "；原選取項目已不在清單，改選第一筆" if view.items else "；原選取項目已不在清單"
         elif message.kind == "open":
             self.set_status(message.payload)
             return
@@ -596,6 +682,23 @@ class FileFinderApp(App):
             self.index_checking = True
             self.set_status(self.navigation.view.status)
             self.check_index(self.index_sequence, self.index_cancel)
+
+    def update_view_items(self, items) -> bool:
+        """重查或更新後依完整路徑還原選取，避免排序改變造成換檔。"""
+        view = self.navigation.view
+        selected = view.selected
+        previous = view.items[selected] if selected is not None and 0 <= selected < len(view.items) else None
+        view.items = items
+        if previous is None:
+            view.selected = None
+            return False
+        key = backend.path_key(previous.path)
+        view.selected = next((index for index, item in enumerate(items)
+                              if item is not None and backend.path_key(item.path) == key), None)
+        if view.selected is None:
+            view.selected = 0 if items else None
+            return True
+        return False
 
     @work(thread=True, exclusive=True, group="index-check")
     def check_index(self, sequence: int, cancel: Event) -> None:
@@ -621,6 +724,8 @@ class FileFinderApp(App):
         if warnings:
             warnings.append("Ctrl+E 查看全部錯誤")
         ready = "尚無最愛；選取檔案或資料夾後按 Ctrl+F 收藏" if self.active_menu == "favorites" and not items else "準備搜尋"
+        if self.active_menu == "favorites" and not items and self.favorites and self.favorites.paths and self.navigation.view.options.kind != "all":
+            ready = "目前類型篩選沒有符合的最愛"
         return ready + ("\n" + "\n".join(warnings) if warnings else "")
 
     @staticmethod
@@ -652,6 +757,7 @@ class FileFinderApp(App):
 
     def render_view(self) -> None:
         view = self.navigation.view
+        self.sync_search_controls()
         favorite_keys = {backend.path_key(path) for path in tuple(self.favorites.paths)} if self.favorites else set()
         kind, menu = view.kind, self.active_menu
 
@@ -674,6 +780,8 @@ class FileFinderApp(App):
         results.set_items(view.items, format_item, 2 if kind == "browse" else 3, view.selected)
         view.selected = results.highlighted
         scope = "我的最愛名稱" if self.active_menu == "favorites" else "設定的根目錄"
+        if view.directory is not None and view.scope != "all":
+            scope = f"{'目前資料夾' if view.scope == 'current' else '包含子資料夾'}：{display_text(view.directory)}"
         location = display_text(view.directory) if view.kind == "browse" else (f"搜尋：{display_text(view.query)}（{scope}；關鍵字全部符合）" if view.kind == "search" else "")
         location_widget = self.query_one("#location", Static)
         location_widget.update(location)
@@ -694,7 +802,7 @@ class FileFinderApp(App):
     def on_key(self, event: events.Key) -> None:
         if isinstance(self.screen, ModalScreen):
             return
-        if self.query_one("#theme-select", Select).has_focus_within:
+        if any(selector.has_focus_within for selector in self.query(Select)):
             return
         if isinstance(self.focused, (Input, Tabs)) and event.key in {"down", "up"}:
             results = self.query_one(OptionList)
@@ -717,7 +825,7 @@ class FileFinderApp(App):
     def on_paste(self, event: events.Paste) -> None:
         if isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input):
             return
-        if self.query_one("#theme-select", Select).has_focus_within:
+        if any(selector.has_focus_within for selector in self.query(Select)):
             return
         search = self.query_one(Input)
         if not search.disabled:
@@ -763,7 +871,7 @@ class FileFinderApp(App):
             self.set_input("")
             self.render_view()
             self.query_one(OptionList).focus()
-            self.load_folder(generation, item.path, cancel)
+            self.load_folder(generation, item.path, cancel, self.navigation.view.options)
         else:
             # 不以副檔名推測安全性；所有檔案均先確認，取消為預設。
             self.push_screen(ConfirmOpen(item.path), lambda confirmed: self.open_item(item) if confirmed else None)
@@ -865,7 +973,7 @@ class FileFinderApp(App):
         self.set_input("")
         self.render_view()
         if self.config and self.favorites:
-            self.load_home(generation, cancel, self.active_menu)
+            self.load_home(generation, cancel, self.active_menu, self.navigation.view.options)
         self.query_one(Input).focus()
 
     def action_back(self) -> None:
@@ -899,9 +1007,9 @@ class FileFinderApp(App):
         self.render_view()
         if view.kind == "browse":
             # 重新呈現同一份共用索引；只有未完整掃過或按 F5 才讀取磁碟。
-            self.load_folder(generation, view.directory, cancel)
+            self.load_folder(generation, view.directory, cancel, view.options)
         elif view.kind == "home":
-            self.load_home(generation, cancel, self.active_menu)
+            self.load_home(generation, cancel, self.active_menu, view.options)
         elif view.report is None or refresh:
             view.report = None
             self.start_search(generation, view.query, cancel)
@@ -955,7 +1063,7 @@ class FileFinderApp(App):
         self.favorite_busy = False
         if self.navigation.view.kind == "home":
             generation, cancel = self.invalidate()
-            self.load_home(generation, cancel, self.active_menu)
+            self.load_home(generation, cancel, self.active_menu, self.navigation.view.options)
         elif self.active_menu == "favorites" and self.navigation.view.kind == "search":
             # 收藏搜尋中移除項目後重新篩選，不保留已取消的收藏結果。
             self.search_changed(self.query_one(Input).value)

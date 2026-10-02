@@ -251,8 +251,46 @@ def match_rank(query: str, name: str) -> int | None:
     return 0 if query in name else 1
 
 
-def search_key(query: str, item: Item) -> tuple:
-    return (not item.is_dir, match_rank(query, item.name), len(item.name), item.name.casefold(), path_key(item.path))
+FILE_TYPE_EXTENSIONS = {
+    "sql": frozenset({".sql"}),
+    "word": frozenset({".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm"}),
+    "excel": frozenset({".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm"}),
+}
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    """搜尋與瀏覽共用的顯示條件；不影響完整目錄索引的內容。"""
+    kind: str = "all"
+    sort: str = "relevance"
+
+    def __post_init__(self):
+        if self.kind not in {"all", "files", "folders", "sql", "word", "excel"}:
+            raise ValueError("不支援的檔案類型篩選")
+        if self.sort not in {"relevance", "name", "modified"}:
+            raise ValueError("不支援的排序方式")
+
+    def matches(self, item: Item) -> bool:
+        """文件類型只列檔案；副檔名比對不分大小寫。"""
+        if self.kind == "all":
+            return True
+        if self.kind == "folders":
+            return item.is_dir
+        if item.is_dir:
+            return False
+        if self.kind == "files":
+            return True
+        return item.path.suffix.casefold() in FILE_TYPE_EXTENSIONS[self.kind]
+
+
+def search_key(query: str, item: Item, sort: str = "relevance") -> tuple:
+    """資料夾永遠在前；未知修改時間排在同類項目的最後。"""
+    tail = (item.name.casefold(), path_key(item.path))
+    if sort == "modified":
+        return (not item.is_dir, item.modified_at is None, -(item.modified_at or 0), *tail)
+    if sort == "name" or not query:
+        return (not item.is_dir, *tail)
+    return (not item.is_dir, match_rank(query, item.name), len(item.name), *tail)
 
 
 def entry_item(entry: os.DirEntry) -> Item | None:
@@ -596,7 +634,7 @@ class DirectoryIndex:
             lock.release()
 
 
-def scan_names(config: Config, query: str, cancel: Event | None = None, progress: Callable[[SearchProgress], None] | None = None, index: DirectoryIndex | None = None) -> ScanReport:
+def scan_names(config: Config, query: str, cancel: Event | None = None, progress: Callable[[SearchProgress], None] | None = None, index: DirectoryIndex | None = None, *, options: SearchOptions = SearchOptions(), directory: Path | None = None, recursive: bool = True) -> ScanReport:
     cancel = cancel or Event()
     index = index if index is not None else DirectoryIndex()
     best: list[tuple[tuple, Item]] = []
@@ -605,12 +643,14 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
     total = scanned = skipped_links = 0
     cached_directories = read_directories = 0
     limited = False
+    search_directory = directory
     directory = None
     last_progress = float("-inf")
     if not query.strip():
         return ScanReport()
     # 根目錄本身也屬於名稱搜尋範圍；重疊根目錄只計算一次。
-    stack = [(root.path, True) for root in reversed(config.roots)]
+    # 指定資料夾時只比對其內容，不把搜尋範圍本身列成命中結果。
+    stack = [(search_directory, False)] if search_directory is not None else [(root.path, True) for root in reversed(config.roots)]
 
     def publish_progress(force: bool = False) -> None:
         nonlocal last_progress
@@ -624,10 +664,10 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
 
     def consider(item: Item) -> None:
         nonlocal total
-        if match_rank(query, item.name) is None:
+        if not options.matches(item) or match_rank(query, item.name) is None:
             return
         total += 1
-        candidate = (search_key(query, item), item)
+        candidate = (search_key(query, item, options.sort), item)
         if len(best) < RESULT_LIMIT or candidate[0] < best[-1][0]:
             bisect.insort(best, candidate, key=lambda value: value[0])
             if len(best) > RESULT_LIMIT:
@@ -669,7 +709,8 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
                     if item.is_dir:
                         # 在發現時就計算名稱；展開時不再次計算。
                         consider(item)
-                        stack.append((item.path, False))
+                        if recursive:
+                            stack.append((item.path, False))
                     else:
                         consider(item)
         except ExcludedLinkError:
@@ -680,7 +721,7 @@ def scan_names(config: Config, query: str, cancel: Event | None = None, progress
     return ScanReport(tuple(item for _, item in best), total, scanned, tuple(errors), cancel.is_set(), limited, skipped_links, cached_directories, read_directories)
 
 
-def browse_folder(directory: Path, cancel: Event | None = None, index: DirectoryIndex | None = None) -> ScanReport:
+def browse_folder(directory: Path, cancel: Event | None = None, index: DirectoryIndex | None = None, *, options: SearchOptions = SearchOptions()) -> ScanReport:
     """只讀取直接子項目；此處不套用搜尋的 200 筆顯示上限。"""
     cancel = cancel or Event()
     track_cache = index is not None
@@ -706,14 +747,15 @@ def browse_folder(directory: Path, cancel: Event | None = None, index: Directory
                 elif item is None:
                     skipped_links += 1
                 else:
-                    items.append(item)
+                    if options.matches(item):
+                        items.append(item)
     except ExcludedLinkError:
         skipped_links += 1
     except OSError as error:
         errors.append(path_error(directory, error))
     except ValueError:
         errors.append(f"{display_text(directory)}：路徑格式錯誤")
-    items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
+    items.sort(key=lambda item: search_key("", item, options.sort))
     return ScanReport(tuple(items), len(items), scanned, tuple(errors), cancel.is_set(), False, skipped_links, cached_directories, read_directories)
 
 
@@ -788,21 +830,23 @@ class Favorites:
         return not exists
 
 
-def list_favorites(favorites: Favorites, cancel: Event, index: DirectoryIndex | None = None) -> tuple[Item, ...]:
+def list_favorites(favorites: Favorites, cancel: Event, index: DirectoryIndex | None = None, *, options: SearchOptions = SearchOptions()) -> tuple[Item, ...]:
     """只讀取已收藏路徑，不展開其中的資料夾；資料夾排序在前。"""
     items: list[Item] = []
     for path in tuple(favorites.paths):
         if cancel.is_set():
             break
-        items.append(path_item(path, index=index))
-    items.sort(key=lambda item: (not item.is_dir, item.name.casefold(), path_key(item.path)))
+        item = path_item(path, index=index)
+        if options.matches(item):
+            items.append(item)
+    items.sort(key=lambda item: search_key("", item, options.sort))
     return tuple(items)
 
 
-def list_home_items(config: Config, favorites: Favorites, cancel: Event, menu: str = "folders", index: DirectoryIndex | None = None) -> tuple[Item, ...]:
+def list_home_items(config: Config, favorites: Favorites, cancel: Event, menu: str = "folders", index: DirectoryIndex | None = None, *, options: SearchOptions = SearchOptions()) -> tuple[Item, ...]:
     """讀取指定分頁的首頁項目，前端不直接存取檔案系統。"""
     if menu == "favorites":
-        return list_favorites(favorites, cancel, index)
+        return list_favorites(favorites, cancel, index, options=options)
     items: list[Item] = []
     for root in config.roots:
         if cancel.is_set():
@@ -811,10 +855,10 @@ def list_home_items(config: Config, favorites: Favorites, cancel: Event, menu: s
     return tuple(items)
 
 
-def search_favorites(favorites: Favorites, query: str, cancel: Event, index: DirectoryIndex | None = None) -> ScanReport:
+def search_favorites(favorites: Favorites, query: str, cancel: Event, index: DirectoryIndex | None = None, *, options: SearchOptions = SearchOptions()) -> ScanReport:
     """依完整關鍵字篩選收藏名稱，保留取消與讀取錯誤資訊。"""
-    items = list_favorites(favorites, cancel, index)
-    matches = sorted((item for item in items if match_rank(query, item.name) is not None), key=lambda item: search_key(query, item))
+    items = list_favorites(favorites, cancel, index, options=options)
+    matches = sorted((item for item in items if match_rank(query, item.name) is not None), key=lambda item: search_key(query, item, options.sort))
     return ScanReport(tuple(matches[:RESULT_LIMIT]), len(matches), len(items), tuple(item.error for item in items if item.error), cancel.is_set())
 
 
