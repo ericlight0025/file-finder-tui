@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.favorites-*.tmp
+.favorites-*.lock
+.file-finder-index.sqlite3*
+
+# 個人搜尋路徑與收藏只保存在本機。
+/config.json
+/favorites.json
+
+# 工程審查報告只在本機產生，不納入版本控制。
+/performance.md
+/review.md
+/risk.md
+/test-report.md

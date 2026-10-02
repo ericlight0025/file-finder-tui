@@ -1,0 +1,8 @@
+{
+  "roots": [
+    {"name": "Project A", "path": "C:\\Projects\\Alpha"},
+    {"name": "Project B", "path": "C:\\Projects\\Beta"},
+    {"name": "Project C", "path": "U:\\SQL"}
+  ],
+  "max_scan_entries": 250000
+}
