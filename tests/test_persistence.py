@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,3 +258,198 @@ def test_write_failure_stays_nonfatal_and_preserves_source(project, monkeypatch)
     assert index.error
     assert scan_names(config, "report", index=index).total == 1
     assert target.read_text(encoding="utf-8") == "原始資料"
+
+
+def count_metadata_checks(monkeypatch):
+    """分別計算逐層祖先檢查與只檢查自身的次數。"""
+    full, own = Counter(), Counter()
+    original_plain, original_own = backend.plain_metadata, backend.own_metadata
+
+    def counted_plain(path):
+        full[Path(path)] += 1
+        return original_plain(path)
+
+    def counted_own(path):
+        own[Path(path)] += 1
+        return original_own(path)
+
+    monkeypatch.setattr(backend, "plain_metadata", counted_plain)
+    monkeypatch.setattr(backend, "own_metadata", counted_own)
+    return full, own
+
+
+def test_f5_time_refresh_checks_entries_themselves_not_every_ancestor(project, monkeypatch):
+    config, _ = project
+    root = config.roots[0].path
+    files = [root / f"report{number}.txt" for number in range(20)]
+    for path in files:
+        path.touch()
+    index = DirectoryIndex()
+    browse_folder(root, index=index)
+    full, own = count_metadata_checks(monkeypatch)
+    assert index.check_changes(Event(), refresh_times=True).changed == 0
+    # 目錄本身逐層檢查一次；每個項目只檢查自身，祖先不隨項目數重複 lstat。
+    assert full == {root: 1}
+    assert all(own[path] == 1 for path in files)
+    assert own[root] == own[root.parent] == 1
+
+
+def test_f5_time_refresh_still_rejects_entry_replaced_by_reparse_point(project, monkeypatch):
+    config, _ = project
+    root = config.roots[0].path
+    target = root / "report.txt"
+    target.touch()
+    index = DirectoryIndex()
+    browse_folder(root, index=index)
+    original = Path.lstat
+
+    def reparse(path, *args, **kwargs):
+        metadata = original(path, *args, **kwargs)
+        if path == target:
+            return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=backend.REPARSE_POINT)
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", reparse)
+    checked = index.check_changes(Event(), refresh_times=True)
+    assert checked.changed == 1 and "reparse point" in checked.errors[0]
+    assert index.directory_item(root) is None
+
+
+def test_load_reads_each_scope_range_in_one_query_without_sibling_prefixes(project, monkeypatch):
+    config, file = project
+    root = config.roots[0].path
+    child = root / "child"
+    child.mkdir()
+    # 名稱以根目錄開頭但不在其底下；「[」與空白排在「\」前，「x」與「]」排在範圍上界之後。
+    siblings = [root.parent / name for name in ("root0 copy", "root0[old]", "root0x", "root0]")]
+    index = DirectoryIndex(file.with_name("cache.sqlite3"))
+    for directory in (root, child, *siblings):
+        directory.mkdir(exist_ok=True)
+        browse_folder(directory, index=index)
+    index.flush()
+    statements = []
+    connect = backend.sqlite3.connect
+
+    def traced(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(backend.sqlite3, "connect", traced)
+    restored = DirectoryIndex(index.file)
+    # 重疊範圍只查一次，同一筆紀錄不重複計算。
+    assert restored.load((root, child, root), Event()) == 2
+    assert restored.directory_item(child) is not None
+    assert all(restored.directory_item(sibling) is None for sibling in siblings)
+    reads = [statement for statement in statements if "FROM finder_directories" in statement]
+    assert len(reads) == 1 and "payload" in reads[0]
+
+
+def test_load_skips_records_over_size_cap(project, monkeypatch):
+    config, file = project
+    root = config.roots[0].path
+    (root / "report.txt").touch()
+    index = DirectoryIndex(file.with_name("cache.sqlite3"))
+    browse_folder(root, index=index)
+    index.flush()
+    monkeypatch.setattr(backend, "MAX_CACHE_RECORD_BYTES", 16)
+    restored = DirectoryIndex(index.file)
+    assert restored.load(scopes(config), Event()) == 0 and not restored.error
+    assert browse_folder(root, index=restored).total == 1
+
+
+def short_lock_timeout(monkeypatch):
+    """鎖定測試不等待正式的 2 秒逾時。"""
+    connect = backend.sqlite3.connect
+    monkeypatch.setattr(backend.sqlite3, "connect", lambda file, *args, **kwargs: connect(file, timeout=0.05))
+
+
+def busy_error():
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    return error
+
+
+def test_locked_database_keeps_pending_writes_for_retry(project, monkeypatch):
+    config, file = project
+    database = file.with_name("cache.sqlite3")
+    index = DirectoryIndex(database)
+    scan_names(config, "nothing", index=index)
+    index.flush()
+    child = config.roots[0].path / "child"
+    child.mkdir()
+    browse_folder(child, index=index)
+    holder = sqlite3.connect(database)
+    try:
+        # 模擬另一個實例持有寫入鎖。
+        holder.execute("BEGIN EXCLUSIVE")
+        short_lock_timeout(monkeypatch)
+        index.flush()
+        assert not index.error and "下次保存時重試" in index.warning
+    finally:
+        holder.close()
+    index.flush()
+    assert not index.error and not index.warning
+    restored = DirectoryIndex(database)
+    assert restored.load(scopes(config), Event()) == 4
+    assert restored.directory_item(child) is not None
+
+
+def test_locked_database_on_startup_does_not_disable_saving(project, monkeypatch):
+    config, file = project
+    database = file.with_name("cache.sqlite3")
+    index = DirectoryIndex(database)
+    scan_names(config, "nothing", index=index)
+    index.flush()
+    restored = DirectoryIndex(database)
+    holder = sqlite3.connect(database)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        short_lock_timeout(monkeypatch)
+        assert restored.load(scopes(config), Event()) == 0
+        assert not restored.error and "未還原" in restored.warning
+    finally:
+        holder.close()
+    (config.roots[0].path / "report.txt").touch()
+    assert scan_names(config, "report", index=restored).total == 1
+    restored.flush()
+    assert not restored.error and not restored.warning
+    again = DirectoryIndex(database)
+    assert again.load(scopes(config), Event()) == 3
+    assert again.check_changes(Event()).changed == 0
+
+
+def test_locked_save_during_rebuild_does_not_requeue_old_records(project, monkeypatch):
+    config, file = project
+    index = DirectoryIndex(file.with_name("cache.sqlite3"))
+    scan_names(config, "nothing", index=index)
+    index.flush()
+    child = config.roots[0].path / "child"
+    child.mkdir()
+    browse_folder(child, index=index)
+    original = index._connect
+
+    def rebuilt_then_locked():
+        index.invalidate()
+        raise busy_error()
+
+    monkeypatch.setattr(index, "_connect", rebuilt_then_locked)
+    index.flush()
+    assert not index.error and index.warning
+    monkeypatch.setattr(index, "_connect", original)
+    index.flush()
+    assert not index.warning
+    restored = DirectoryIndex(index.file)
+    assert restored.load(scopes(config), Event()) == 0
+
+
+@pytest.mark.parametrize("code,transient", [
+    (sqlite3.SQLITE_BUSY, True), (sqlite3.SQLITE_LOCKED, True), (sqlite3.SQLITE_BUSY | (2 << 8), True),
+    (sqlite3.SQLITE_IOERR, False), (sqlite3.SQLITE_READONLY, False), (None, False),
+])
+def test_only_busy_or_locked_sqlite_errors_are_retried(code, transient):
+    error = sqlite3.OperationalError("模擬錯誤")
+    if code is not None:
+        error.sqlite_errorcode = code
+    assert DirectoryIndex._transient(error) is transient
+    assert not DirectoryIndex._transient(ValueError("索引版本不符"))
