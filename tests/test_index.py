@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -133,17 +134,102 @@ def test_scan_limit_does_not_save_partial_snapshot_or_destroy_full_snapshot(proj
 def test_refresh_invalidates_only_selected_directory(project, monkeypatch):
     config, _ = project
     root = config.roots[0].path
+    target = root / "new.xlsx"
+    target.touch()
     calls = record_scans(monkeypatch)
     index = DirectoryIndex()
     scan_names(config, "new", index=index)
-    target = root / "new.xlsx"
-    target.touch()
-    assert scan_names(config, "new", index=index).total == 0
     index.invalidate(root)
     report = scan_names(config, "new", index=index)
     assert report.total == 1 and report.items[0].path == target
+    assert report.read_directories == 1 and report.cached_directories == 2
     assert calls[root] == 2
     assert calls[config.roots[1].path] == calls[config.roots[2].path] == 1
+
+
+def test_created_and_deleted_files_in_scanned_folder_are_seen_without_f5(project, monkeypatch):
+    """同一份索引再次搜尋時核對目錄本身；只重讀變動的資料夾，結果不因舊快取而少列。"""
+    config, _ = project
+    root = config.roots[0].path
+    child = root / "child"
+    child.mkdir()
+    (child / "old.txt").touch()
+    calls = record_scans(monkeypatch)
+    index = DirectoryIndex()
+    assert scan_names(config, "report", index=index).total == 0
+    target = child / "report.txt"
+    target.touch()
+    report = scan_names(config, "report", index=index)
+    assert report.complete and report.total == 1 and report.items[0].path == target
+    assert "命中總數 1 筆" in report.status()
+    assert calls[child] == 2 and calls[root] == 1
+    assert report.read_directories == 1 and report.cached_directories == 3
+    target.unlink()
+    report = scan_names(config, "report", index=index)
+    assert report.complete and report.total == 0
+    assert calls[child] == 3 and calls[root] == 1
+    assert not any(item.name == "report.txt" for item in browse_folder(child, index=index).items)
+    assert calls[child] == 3
+
+
+def test_changed_snapshot_is_replaced_and_reused_afterwards(project, monkeypatch):
+    config, _ = project
+    root = config.roots[0].path
+    index = DirectoryIndex()
+    browse_folder(root, index=index)
+    (root / "report.txt").touch()
+    calls = record_scans(monkeypatch)
+    assert browse_folder(root, index=index).total == 1
+    assert browse_folder(root, index=index).cached_directories == 1
+    assert calls[root] == 1
+
+
+def test_cached_directory_replaced_by_reparse_point_is_not_listed(project, monkeypatch):
+    config, _ = project
+    root = config.roots[0].path
+    child = root / "child"
+    child.mkdir()
+    (child / "report.txt").touch()
+    index = DirectoryIndex()
+    assert scan_names(config, "report", index=index).total == 1
+    original = Path.lstat
+
+    def reparse(path, *args, **kwargs):
+        metadata = original(path, *args, **kwargs)
+        if path == child:
+            return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=backend.REPARSE_POINT)
+        return metadata
+
+    monkeypatch.setattr(backend.os, "scandir", lambda *_: pytest.fail("不應枚舉 reparse point"))
+    monkeypatch.setattr(Path, "lstat", reparse)
+    report = scan_names(replace(config, roots=config.roots[:1]), "report", index=index)
+    assert report.total == 0 and report.skipped_links == 1 and report.cached_directories == 1
+
+
+def test_cold_read_walks_ancestors_once_and_cache_reuse_checks_only_itself(project, monkeypatch):
+    config, _ = project
+    root = config.roots[0].path
+    deep = root / "a" / "b"
+    deep.mkdir(parents=True)
+    (deep / "report.txt").touch()
+    single = replace(config, roots=config.roots[:1])
+    directories = (root, root / "a", deep)
+    full = Counter()
+    original = backend.plain_metadata
+
+    def counted(path):
+        full[Path(path)] += 1
+        return original(path)
+
+    monkeypatch.setattr(backend, "plain_metadata", counted)
+    index = DirectoryIndex()
+    assert scan_names(single, "report", index=index).total == 1
+    # 讀取前逐層檢查一次；讀取後只比對目錄本身，不再走訪祖先。
+    assert full == {directory: 1 for directory in directories}
+    full.clear()
+    report = scan_names(single, "report", index=index)
+    assert report.total == 1 and report.cached_directories == 3
+    assert not full
 
 
 @pytest.mark.parametrize("refresh", [False, True])

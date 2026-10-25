@@ -13,7 +13,7 @@ import pytest
 
 import backend
 import main
-from backend import Config, Item, Root, entry_item, load_config, match_rank, scan_names
+from backend import Config, Favorites, Item, Root, SearchOptions, entry_item, load_config, match_rank, scan_names, search_favorites
 from main import RequestGate
 
 
@@ -27,9 +27,33 @@ from main import RequestGate
     ("REPORT\t2026", "2026_report.xlsx", 1),
     ("  ", "report.xlsx", None),
     ("報告", "報表_公告.xlsx", None),
+    # 全形英數與 NFD 組合字元（常見於 macOS 壓縮檔）視同一般輸入。
+    ("ＡＢＣ", "abc.txt", 0), ("abc", "ＡＢＣ.txt", 0),
+    ("café", "café.txt", 0), ("café", "CAFÉ.txt", 0),
+    ("２０２６ 契變", "2026_契變.xlsx", 1), ("ＡＢＣ", "ab.txt", None),
 ])
 def test_all_keywords_must_match_complete_substrings(query, name, expected):
     assert match_rank(query, name) == expected
+
+
+def test_full_width_and_decomposed_names_match_in_scans_filters_and_favorites(project, tmp_path):
+    config, _ = project
+    root = config.roots[0].path
+    decomposed = root / "café_報告.txt"
+    wide = root / "ＡＢＣ２０２６.sql"
+    decomposed.touch()
+    wide.touch()
+    assert [item.path for item in scan_names(config, "café 報告").items] == [decomposed]
+    report = scan_names(config, "abc 2026", options=SearchOptions(kind="sql"))
+    assert [item.path for item in report.items] == [wide]
+    report = scan_names(config, "CAFÉ", directory=root, recursive=False)
+    assert [item.path for item in report.items] == [decomposed]
+    favorites = Favorites(tmp_path / "favorites.json")
+    favorites.toggle(wide)
+    assert [item.path for item in search_favorites(favorites, "ａｂｃ", Event()).items] == [wide]
+    # 名稱排序也使用相同正規化，全形字母排在對應的半形字母位置。
+    items = [Item(root / name, False) for name in ("c.txt", "Ｂ.txt", "a.txt")]
+    assert [item.name for item in sorted(items, key=lambda item: backend.search_key("", item, "name"))] == ["a.txt", "Ｂ.txt", "c.txt"]
 
 
 def test_recursive_same_names_and_no_content_reads(project, monkeypatch):

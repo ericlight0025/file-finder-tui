@@ -514,7 +514,8 @@ def test_startup_input_and_escape_do_not_cancel_initialization(project, monkeypa
     asyncio.run(scenario())
 
 
-def test_tui_returns_to_cached_folder_and_f5_updates_children(project):
+def test_tui_returns_to_cached_folder_and_sees_new_children(project):
+    """返回已掃描資料夾時核對目錄本身；新增項目不需 F5，未變動時 F5 仍重用快取。"""
     config, file = project
     root = config.roots[0].path
     child = root / "child"
@@ -533,11 +534,12 @@ def test_tui_returns_to_cached_folder_and_f5_updates_children(project):
             (root / "new.txt").touch()
             await pilot.press("backspace")
             await wait_until(lambda: app.navigation.view.directory == root and app.navigation.view.report is not None)
-            assert not any(item.name == "new.txt" for item in app.navigation.view.items)
-            assert app.navigation.view.report.cached_directories == 1
-            await pilot.press("f5")
-            await wait_until(lambda: any(item.name == "new.txt" for item in app.navigation.view.items))
+            assert any(item.name == "new.txt" for item in app.navigation.view.items)
             assert app.navigation.view.report.read_directories == 1
+            await pilot.press("f5")
+            await wait_until(lambda: app.navigation.view.report is not None)
+            assert any(item.name == "new.txt" for item in app.navigation.view.items)
+            assert app.navigation.view.report.cached_directories == 1
 
     asyncio.run(scenario())
 

@@ -10,9 +10,11 @@ import os
 import sqlite3
 import stat
 import tempfile
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic
@@ -62,17 +64,20 @@ class ExcludedLinkError(OSError):
     """拒絕目標及父路徑上的符號連結與 Windows reparse point。"""
 
 
-def plain_metadata(path: Path) -> os.stat_result:
-    # 不用 resolve() 跟隨連結；逐層檢查原始路徑的祖先。
-    absolute = Path(os.path.abspath(path))
-    for parent in reversed(absolute.parents):
-        parent_metadata = parent.lstat()
-        if stat.S_ISLNK(parent_metadata.st_mode) or getattr(parent_metadata, "st_file_attributes", 0) & REPARSE_POINT:
-            raise ExcludedLinkError(str(parent))
+def own_metadata(path: Path) -> os.stat_result:
+    """只 lstat 目標本身並拒絕連結，不逐層檢查父路徑。"""
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & REPARSE_POINT:
         raise ExcludedLinkError(str(path))
     return metadata
+
+
+def plain_metadata(path: Path) -> os.stat_result:
+    # 不用 resolve() 跟隨連結；逐層檢查原始路徑的祖先。
+    absolute = Path(os.path.abspath(path))
+    for parent in reversed(absolute.parents):
+        own_metadata(parent)
+    return own_metadata(path)
 
 
 @contextmanager
@@ -241,9 +246,14 @@ class ScanReport:
         return result
 
 
+def name_key(text: str) -> str:
+    """名稱比對前統一 Unicode 相容形式與大小寫：全形英數與 NFD 組合字元可對應一般輸入。"""
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
 def match_rank(query: str, name: str) -> int | None:
-    """空白分隔的每個關鍵字都須完整出現在名稱中，忽略大小寫。"""
-    query, name = query.strip().casefold(), name.casefold()
+    """空白分隔的每個關鍵字都須完整出現在名稱中，忽略大小寫與全形／半形差異。"""
+    query, name = name_key(query).strip(), name_key(name)
     words = query.split()
     if not words or not all(word in name for word in words):
         return None
@@ -285,7 +295,7 @@ class SearchOptions:
 
 def search_key(query: str, item: Item, sort: str = "relevance") -> tuple:
     """資料夾永遠在前；未知修改時間排在同類項目的最後。"""
-    tail = (item.name.casefold(), path_key(item.path))
+    tail = (name_key(item.name), path_key(item.path))
     if sort == "modified":
         return (not item.is_dir, item.modified_at is None, -(item.modified_at or 0), *tail)
     if sort == "name" or not query:
@@ -369,6 +379,7 @@ class DirectoryIndex:
         self._versions: dict[str, int] = {}
         self.file = file
         self.error = ""
+        self.warning = ""  # 暫時鎖定只提示並保留待存變更，不停用保存
         self._database_lock = Lock()
         self._pending: dict[str, DirectorySnapshot | None] = {}
         self._reset_pending = False
@@ -408,24 +419,34 @@ class DirectoryIndex:
     def _storage_error(self) -> None:
         self.error = "索引快取無法讀寫，已改用記憶體索引；搜尋仍可使用。"
 
+    @staticmethod
+    def _transient(error: Exception) -> bool:
+        """只有資料庫忙碌／鎖定屬暫時狀態；格式、版本、磁碟或權限錯誤仍停用保存。"""
+        code = getattr(error, "sqlite_errorcode", None)
+        return isinstance(error, sqlite3.OperationalError) and type(code) is int and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
     def load(self, scopes: tuple[Path, ...], cancel: Event) -> int:
         """只還原本次搜尋／收藏範圍的完整目錄；磁碟核對在背景另行執行。"""
         if self.file is None or self.error:
             return 0
-        prefixes = tuple(path_key(scope).rstrip("\\") for scope in scopes)
+        keys = sorted({path_key(scope).rstrip("\\") for scope in scopes})
+        # 被其他範圍包含的前綴不再查詢，同一筆紀錄不會重複還原。
+        prefixes = [key for key in keys if not any(key.startswith(other + "\\") for other in keys)]
         restored = 0
         restored_entries = 0
         try:
             with self._database_lock:
                 connection = self._connect()
                 try:
+                    # 以主鍵範圍一次讀取本範圍的 key 與內容；「]」是「\」的下一個字元。
                     # 每份快取最多 64 MiB；避免異常快取造成無界單次讀取。
-                    for (key,) in connection.execute("SELECT key FROM finder_directories WHERE typeof(key) = 'text' AND typeof(payload) = 'text' AND length(CAST(payload AS BLOB)) <= ?", (MAX_CACHE_RECORD_BYTES,)):
+                    rows = chain.from_iterable(connection.execute(
+                        "SELECT key, payload FROM finder_directories WHERE (key = ? OR (key >= ? AND key < ?))"
+                        " AND typeof(key) = 'text' AND typeof(payload) = 'text' AND length(CAST(payload AS BLOB)) <= ?",
+                        (prefix, prefix + "\\", prefix + "]", MAX_CACHE_RECORD_BYTES)) for prefix in prefixes)
+                    for key, payload in rows:
                         if cancel.is_set():
                             break
-                        if not any(key == prefix or key.startswith(prefix + "\\") for prefix in prefixes):
-                            continue
-                        payload = connection.execute("SELECT payload FROM finder_directories WHERE key = ?", (key,)).fetchone()[0]
                         try:
                             data = json.loads(payload)
                             directory, modified, signature, records = data
@@ -459,8 +480,11 @@ class DirectoryIndex:
                         restored_entries += len(entries)
                 finally:
                     connection.close()
-        except (OSError, sqlite3.Error, ValueError):
-            self._storage_error()
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if self._transient(error):
+                self.warning = "索引快取暫時被鎖定（可能有另一個實例），本次未還原保存的索引；搜尋仍可使用，稍後保存時重試。"
+            else:
+                self._storage_error()
         return restored
 
     @staticmethod
@@ -479,6 +503,7 @@ class DirectoryIndex:
             with self._guard:
                 pending, self._pending = self._pending, {}
                 reset, self._reset_pending = self._reset_pending, False
+                generation = self._generation
             if not pending and not reset:
                 return
             try:
@@ -499,8 +524,18 @@ class DirectoryIndex:
                                     connection.execute("DELETE FROM finder_directories WHERE key = ?", (key,))
                 finally:
                     connection.close()
-            except (OSError, sqlite3.Error, ValueError):
-                self._storage_error()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                if not self._transient(error):
+                    self._storage_error()
+                    return
+                with self._guard:
+                    # 交易已回復；放回待存變更下次重試，較新的變更優先；完整重建後不放回舊變更。
+                    if generation == self._generation:
+                        self._pending = {**pending, **self._pending}
+                    self._reset_pending = self._reset_pending or reset
+                self.warning = "索引快取暫時被鎖定（可能有另一個實例），尚未保存的變更將於下次保存時重試；搜尋仍可使用。"
+            else:
+                self.warning = ""
 
     def check_changes(self, cancel: Event, directory: Path | None = None, *, refresh_times: bool = False) -> IndexCheck:
         """核對每個已索引目錄的時間／身分；只有變動目錄才重新枚舉。"""
@@ -533,7 +568,8 @@ class DirectoryIndex:
                         if item is None:
                             updated.append(None)
                         else:
-                            info = plain_metadata(item.path)
+                            # 父目錄剛以完整祖先檢查確認；每個項目只需檢查自身，不再逐層 lstat。
+                            info = own_metadata(item.path)
                             updated.append(replace(item, is_dir=stat.S_ISDIR(info.st_mode), modified_at=info.st_mtime))
                     if cancel.is_set():
                         break
@@ -598,8 +634,19 @@ class DirectoryIndex:
                 version = (self._generation, self._versions.get(key, 0))
                 snapshot = self._snapshots.get(key)
             if snapshot is not None:
-                yield DirectoryListing(snapshot.root, iter(snapshot.entries), True)
-                return
+                # 重用前只 lstat 目錄本身核對時間與身分；執行期間新增、刪除或改名的項目不會被舊快取隱藏。
+                try:
+                    current = directory_signature(own_metadata(directory))
+                except OSError:
+                    current = None
+                if current == snapshot.signature:
+                    yield DirectoryListing(snapshot.root, iter(snapshot.entries), True)
+                    return
+                with self._guard:
+                    if self._snapshots.get(key) is snapshot:
+                        self._discard(key)
+                    # 捨棄後重新取得版本；之後的更新或重建仍會阻止本次結果寫回。
+                    version = (self._generation, self._versions.get(key, 0))
             records: list[Item | str | None] = []
             complete = failed = False
             metadata = plain_metadata(directory)
@@ -622,8 +669,8 @@ class DirectoryIndex:
 
                 yield DirectoryListing(root, read_entries())
             if complete and not failed and not cancel.is_set():
-                # 掃描途中變動的資料夾不保存為完整索引。
-                after = plain_metadata(directory)
+                # 掃描途中變動的資料夾不保存為完整索引；祖先已在讀取前檢查，這裡只比對目錄本身。
+                after = own_metadata(directory)
                 snapshot = DirectorySnapshot(root, tuple(records), directory_signature(metadata))
                 with self._guard:
                     if version == (self._generation, self._versions.get(key, 0)) and directory_signature(after) == snapshot.signature:

@@ -33,6 +33,26 @@ def test_status_update_after_widget_unmount_is_safe(project):
     asyncio.run(scenario())
 
 
+def test_status_shows_transient_index_lock_until_saved(project):
+    """暫時鎖定只提示待重試，不顯示成已停用保存；保存成功後提示消失。"""
+    _, file = project
+
+    async def scenario():
+        app = FileFinderApp(file)
+        async with app.run_test() as pilot:
+            await wait_until(lambda: app.config is not None)
+            app.directory_index.warning = "索引快取暫時被鎖定，稍後重試"
+            app.set_status("準備搜尋")
+            shown = str(app.query_one("#status", Static).render())
+            assert "暫時被鎖定" in shown and "已改用記憶體索引" not in shown
+            app.directory_index.warning = ""
+            app.set_status("準備搜尋")
+            assert "暫時被鎖定" not in str(app.query_one("#status", Static).render())
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
 def test_theme_dropdown_changes_palette_without_resetting_view(project, monkeypatch):
     """下拉切換三套主題，畫面內容與搜尋文字不重設。"""
     config, file = project
@@ -238,7 +258,6 @@ def test_restart_background_check_updates_current_query_after_nested_change(proj
     backend.scan_names(config, "new", index=index)
     index.flush()
     target = child / "new.txt"
-    target.touch()
     started, release = Event(), Event()
     original = DirectoryIndex.check_changes
 
@@ -259,6 +278,8 @@ def test_restart_background_check_updates_current_query_after_nested_change(proj
                 app.query_one(Input).value = "new"
                 await wait_until(lambda: app.navigation.view.report is not None)
                 assert not app.navigation.view.items
+                # 搜尋完成後才變動；畫面上的結果只能靠背景核對更新。
+                target.touch()
                 release.set()
                 await wait_until(lambda: not app.index_checking and app.navigation.view.report is not None and app.navigation.view.report.total == 1)
                 assert app.navigation.view.items[0].path == target

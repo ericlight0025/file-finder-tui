@@ -748,8 +748,9 @@ class FileFinderApp(App):
         shown = "狀態：" + display_text(text, multiline=True)
         if self.index_checking:
             shown += "\n已載入保存的索引，背景核對資料夾變動中…"
-        if self.directory_index.error:
-            shown += "\n" + self.directory_index.error
+        storage = self.directory_index.error or self.directory_index.warning
+        if storage:
+            shown += "\n" + storage
         # 結束時背景保存可能剛好回報；畫面已卸載便略過顯示更新。
         status_widgets = self.query("#status")
         if status_widgets:
